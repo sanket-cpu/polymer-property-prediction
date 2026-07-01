@@ -21,7 +21,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem import AllChem, Descriptors, MACCSkeys
 from sklearn.metrics import r2_score
 from sklearn.model_selection import StratifiedGroupKFold
 
@@ -35,11 +35,13 @@ OUTPUT_PATH = "outputs/submission.csv"
 N_FOLDS     = 5
 SEED        = 42
 
-EARLY_STOPPING_ROUNDS = 50  # stop if no improvement for 50 consecutive trees
-N_TRIALS              = 25  # Optuna trials per target (25 x 2 targets x 5 folds = 250 fits)
+EARLY_STOPPING_ROUNDS = 50   # stop if no improvement for 50 consecutive trees
+N_TRIALS              = 50   # Optuna trials per target (50 x 2 targets x 5 folds = 500 fits)
+TUNE_N_ESTIMATORS     = 1000 # lower ceiling during tuning — relative comparison only
+FINAL_N_ESTIMATORS    = 3000 # higher ceiling for final CV — full model quality
 
 LGB_FIXED = {
-    "n_estimators" : 3000,  # high ceiling — early stopping finds the real number
+    "n_estimators" : FINAL_N_ESTIMATORS,  # overridden to TUNE_N_ESTIMATORS during search
     "random_state" : SEED,
     "n_jobs"       : -1,
     "verbose"      : -1,
@@ -54,6 +56,10 @@ def _desc_one(smi):
 def _fp_one(smi):
     mol = Chem.MolFromSmiles(smi)
     return list(AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048))
+
+def _maccs_one(smi):
+    mol = Chem.MolFromSmiles(smi)
+    return list(MACCSkeys.GenMACCSKeys(mol))
 
 def _topo_one(smi):
     # Backbone span: shortest-path distance (in bonds) between the two `*`
@@ -75,16 +81,19 @@ def _topo_one(smi):
 
 def compute_features(df):
     smiles = df["smiles"].tolist()
-    descs = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s) for s in smiles)
-    fps   = Parallel(n_jobs=-1, prefer="threads")(delayed(_fp_one)(s)   for s in smiles)
-    topo  = Parallel(n_jobs=-1, prefer="threads")(delayed(_topo_one)(s) for s in smiles)
+    descs = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s)  for s in smiles)
+    fps   = Parallel(n_jobs=-1, prefer="threads")(delayed(_fp_one)(s)    for s in smiles)
+    maccs = Parallel(n_jobs=-1, prefer="threads")(delayed(_maccs_one)(s) for s in smiles)
+    topo  = Parallel(n_jobs=-1, prefer="threads")(delayed(_topo_one)(s)  for s in smiles)
 
-    desc_df = pd.DataFrame(descs, index=df.index)
-    fp_df   = pd.DataFrame(fps,   index=df.index,
-                            columns=[f"morgan_{i}" for i in range(2048)])
-    topo_df = pd.DataFrame(topo, index=df.index)
+    desc_df  = pd.DataFrame(descs, index=df.index)
+    fp_df    = pd.DataFrame(fps,   index=df.index,
+                             columns=[f"morgan_{i}" for i in range(2048)])
+    maccs_df = pd.DataFrame(maccs, index=df.index,
+                             columns=[f"maccs_{i}" for i in range(167)])
+    topo_df  = pd.DataFrame(topo,  index=df.index)
 
-    combined = pd.concat([desc_df, fp_df, topo_df], axis=1)
+    combined = pd.concat([desc_df, fp_df, maccs_df, topo_df], axis=1)
     # LightGBM handles NaN natively — only need to remove inf
     return combined.replace([np.inf, -np.inf], np.nan)
 
@@ -125,6 +134,7 @@ def make_objective(ttype):
     def objective(trial):
         params = {
             **LGB_FIXED,
+            "n_estimators"     : TUNE_N_ESTIMATORS,
             "num_leaves"       : trial.suggest_int("num_leaves", 15, 127),
             "learning_rate"    : trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
             "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
