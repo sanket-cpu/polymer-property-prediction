@@ -2,13 +2,16 @@
 Baseline model with proper validation harness.
 
 Features  : RDKit descriptors (~210) + Morgan fingerprints (2048 bits)
-            + 2 polymer-topology features (backbone span) = ~2260 total
+            + MACCS keys (167 bits) + topology features (2)
+            + electronic features (3: aromatic rings, aromatic fraction, rotatable bonds)
 Model     : LightGBM, hyperparameters tuned per target with Optuna
-Validation: 5-fold CV grouped by SMILES, stratified by target_type, scored mean R²
+            Tg target is log-transformed before training, inverse-transformed for scoring
+Validation: 5-fold CV grouped by *canonical* SMILES, stratified by target_type, scored mean R²
 Prediction: ensemble of the 5 fold-trained models (average), not a single retrain
+Pipeline  : features -> prune (300-tree probe) -> tune on pruned -> CV + fold ensemble
 
 Run from project root:
-    polymer-property-prediction/Scripts/python.exe scripts/baseline.py
+    .venv/Scripts/python.exe scripts/baseline.py
 Output: outputs/submission.csv
 """
 
@@ -21,7 +24,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem, Descriptors, MACCSkeys
+from rdkit.Chem import AllChem, Descriptors, MACCSkeys, rdMolDescriptors
 from sklearn.metrics import r2_score
 from sklearn.model_selection import StratifiedGroupKFold
 
@@ -35,13 +38,14 @@ OUTPUT_PATH = "outputs/submission.csv"
 N_FOLDS     = 5
 SEED        = 42
 
-EARLY_STOPPING_ROUNDS = 50   # stop if no improvement for 50 consecutive trees
-N_TRIALS              = 50   # Optuna trials per target (50 x 2 targets x 5 folds = 500 fits)
-TUNE_N_ESTIMATORS     = 1000 # lower ceiling during tuning — relative comparison only
-FINAL_N_ESTIMATORS    = 3000 # higher ceiling for final CV — full model quality
+EARLY_STOPPING_ROUNDS = 50
+N_TRIALS              = 20
+TUNE_N_ESTIMATORS     = 1000
+FINAL_N_ESTIMATORS    = 3000
+PROBE_N_ESTIMATORS    = 300  # fast probe used only for feature pruning
 
 LGB_FIXED = {
-    "n_estimators" : FINAL_N_ESTIMATORS,  # overridden to TUNE_N_ESTIMATORS during search
+    "n_estimators" : FINAL_N_ESTIMATORS,
     "random_state" : SEED,
     "n_jobs"       : -1,
     "verbose"      : -1,
@@ -62,39 +66,45 @@ def _maccs_one(smi):
     return list(MACCSkeys.GenMACCSKeys(mol))
 
 def _topo_one(smi):
-    # Backbone span: shortest-path distance (in bonds) between the two `*`
-    # attachment points. This is the repeat unit's "backbone length" — a
-    # longer/more flexible backbone tends to lower Tg, a short rigid one
-    # raises it. star_distance_frac normalizes that span against the whole
-    # molecule's topological diameter, so we also capture whether the
-    # backbone IS basically the whole molecule (frac near 1) or just a path
-    # through a bulkier structure with side groups (frac well below 1).
+    # Fix 2: guard against SMILES without exactly 2 attachment points
     mol = Chem.MolFromSmiles(smi)
     star_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "*"]
+    if len(star_idx) != 2:
+        return {"star_distance": np.nan, "star_distance_frac": np.nan}
     dmat = Chem.GetDistanceMatrix(mol)
     star_dist = dmat[star_idx[0], star_idx[1]]
-    diameter = dmat.max()
+    diameter  = dmat.max()
     return {
-        "star_distance": star_dist,
+        "star_distance"     : star_dist,
         "star_distance_frac": star_dist / diameter if diameter > 0 else 0.0,
+    }
+
+def _electronic_one(smi):
+    # Fix 3: physics-informed features for Egc (band gap)
+    mol      = Chem.MolFromSmiles(smi)
+    n_atoms  = mol.GetNumAtoms()
+    n_arom   = sum(1 for a in mol.GetAtoms() if a.GetIsAromatic())
+    return {
+        "num_aromatic_rings"    : rdMolDescriptors.CalcNumAromaticRings(mol),
+        "aromatic_atom_fraction": n_arom / n_atoms if n_atoms > 0 else 0.0,
+        "num_rotatable_bonds"   : rdMolDescriptors.CalcNumRotatableBonds(mol),
     }
 
 def compute_features(df):
     smiles = df["smiles"].tolist()
-    descs = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s)  for s in smiles)
-    fps   = Parallel(n_jobs=-1, prefer="threads")(delayed(_fp_one)(s)    for s in smiles)
-    maccs = Parallel(n_jobs=-1, prefer="threads")(delayed(_maccs_one)(s) for s in smiles)
-    topo  = Parallel(n_jobs=-1, prefer="threads")(delayed(_topo_one)(s)  for s in smiles)
+    descs  = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s)       for s in smiles)
+    fps    = Parallel(n_jobs=-1, prefer="threads")(delayed(_fp_one)(s)          for s in smiles)
+    maccs  = Parallel(n_jobs=-1, prefer="threads")(delayed(_maccs_one)(s)       for s in smiles)
+    topo   = Parallel(n_jobs=-1, prefer="threads")(delayed(_topo_one)(s)        for s in smiles)
+    elec   = Parallel(n_jobs=-1, prefer="threads")(delayed(_electronic_one)(s)  for s in smiles)
 
-    desc_df  = pd.DataFrame(descs, index=df.index)
-    fp_df    = pd.DataFrame(fps,   index=df.index,
-                             columns=[f"morgan_{i}" for i in range(2048)])
-    maccs_df = pd.DataFrame(maccs, index=df.index,
-                             columns=[f"maccs_{i}" for i in range(167)])
-    topo_df  = pd.DataFrame(topo,  index=df.index)
+    desc_df  = pd.DataFrame(descs,  index=df.index)
+    fp_df    = pd.DataFrame(fps,    index=df.index, columns=[f"morgan_{i}" for i in range(2048)])
+    maccs_df = pd.DataFrame(maccs,  index=df.index, columns=[f"maccs_{i}"  for i in range(167)])
+    topo_df  = pd.DataFrame(topo,   index=df.index)
+    elec_df  = pd.DataFrame(elec,   index=df.index)
 
-    combined = pd.concat([desc_df, fp_df, maccs_df, topo_df], axis=1)
-    # LightGBM handles NaN natively — only need to remove inf
+    combined = pd.concat([desc_df, fp_df, maccs_df, topo_df, elec_df], axis=1)
     return combined.replace([np.inf, -np.inf], np.nan)
 
 
@@ -111,20 +121,56 @@ print(f"  train: {len(train):,} rows  |  test: {len(test):,} rows")
 
 # ── Features ───────────────────────────────────────────────────────────────────
 
-print("\nComputing features (RDKit descriptors + Morgan fingerprints + topology)...")
+print("\nComputing features...")
 X_train = compute_features(train)
 X_test  = compute_features(test)
 print(f"  Done.  {X_train.shape[1]} features per molecule")
 
 y_train     = train["target"].values
-groups      = train["smiles"].values
 strat_label = train["target_type"].values
 
-sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+# Fix 1: Canonical SMILES for grouping.
+# 70% of train SMILES are non-canonical — without this, the same physical
+# molecule can appear in both train and val folds under different string forms.
+groups = train["smiles"].apply(
+    lambda s: Chem.MolToSmiles(Chem.MolFromSmiles(s))
+).values
+
+
+sgkf      = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 cv_splits = list(sgkf.split(X_train, strat_label, groups))
 
 
-# ── Hyperparameter tuning (Optuna, per target) ──────────────────────────────────
+# ── Feature pruning (Fix 5: before tuning) ────────────────────────────────────
+# Prune first so tuning finds hyperparameters valid for the actual feature set
+# the final models will see. colsample_bytree on 2437 features is a different
+# quantity than colsample_bytree on 1300 features — they're not interchangeable.
+
+print(f"\n{'='*58}")
+print(f"  FEATURE PRUNING  ({PROBE_N_ESTIMATORS}-tree probe, before tuning)")
+print(f"{'='*58}\n")
+
+n_orig    = X_train.shape[1]
+keep_cols = set()
+for ttype in ["tg", "egc"]:
+    mask  = strat_label == ttype
+    probe = LGBMRegressor(
+        n_estimators=PROBE_N_ESTIMATORS, num_leaves=63,
+        random_state=SEED, n_jobs=-1, verbose=-1,
+    )
+    probe.fit(X_train[mask], y_train[mask])
+    imp     = pd.Series(probe.feature_importances_, index=X_train.columns)
+    nonzero = imp[imp > 0].index
+    keep_cols.update(nonzero)
+    print(f"  {ttype.upper()}: {len(nonzero):,} / {n_orig:,} features used")
+
+keep_cols = sorted(keep_cols)
+X_train   = X_train[keep_cols]
+X_test    = X_test[keep_cols]
+print(f"\n  Kept {len(keep_cols):,} features, dropped {n_orig - len(keep_cols):,} zero-importance")
+
+
+# ── Hyperparameter tuning (on pruned features) ─────────────────────────────────
 
 print(f"\n{'='*58}")
 print(f"  HYPERPARAMETER TUNING  ({N_TRIALS} trials per target)")
@@ -148,7 +194,8 @@ def make_objective(ttype):
             mask_tr  = strat_label[tr_idx]  == ttype
             mask_val = strat_label[val_idx] == ttype
             X_tr, X_val = X_train.iloc[tr_idx][mask_tr], X_train.iloc[val_idx][mask_val]
-            y_tr, y_val = y_train[tr_idx][mask_tr], y_train[val_idx][mask_val]
+            y_tr        = y_train[tr_idx][mask_tr]
+            y_val       = y_train[val_idx][mask_val]
 
             model = LGBMRegressor(**params)
             model.fit(
@@ -176,13 +223,12 @@ print(f"\n{'='*58}")
 print(f"  FINAL CV  (tuned params)  +  FOLD-ENSEMBLED TEST PREDICTIONS")
 print(f"{'='*58}\n")
 
-test_tg  = test[test["target_type"] == "tg"].copy()
-test_egc = test[test["target_type"] == "egc"].copy()
+test_tg      = test[test["target_type"] == "tg"].copy()
+test_egc     = test[test["target_type"] == "egc"].copy()
 test_subsets = {"tg": test_tg, "egc": test_egc}
 
 test_pred_sum = {ttype: np.zeros(len(subset)) for ttype, subset in test_subsets.items()}
-
-fold_r2 = {"tg": [], "egc": []}
+fold_r2       = {"tg": [], "egc": []}
 
 for fold, (tr_idx, val_idx) in enumerate(cv_splits, 1):
     types_tr  = strat_label[tr_idx]
@@ -193,7 +239,8 @@ for fold, (tr_idx, val_idx) in enumerate(cv_splits, 1):
         mask_tr  = types_tr  == ttype
         mask_val = types_val == ttype
         X_tr, X_val = X_train.iloc[tr_idx][mask_tr], X_train.iloc[val_idx][mask_val]
-        y_tr, y_val = y_train[tr_idx][mask_tr], y_train[val_idx][mask_val]
+        y_tr        = y_train[tr_idx][mask_tr]
+        y_val       = y_train[val_idx][mask_val]
 
         model = LGBMRegressor(**best_params[ttype])
         model.fit(
@@ -201,10 +248,9 @@ for fold, (tr_idx, val_idx) in enumerate(cv_splits, 1):
             eval_set=[(X_val, y_val)],
             callbacks=[early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), log_evaluation(0)],
         )
+
         scores[ttype] = r2_score(y_val, model.predict(X_val))
         fold_r2[ttype].append(scores[ttype])
-
-        # accumulate this fold's prediction on the real test set (ensemble)
         test_pred_sum[ttype] += model.predict(X_test.loc[test_subsets[ttype].index])
 
     mean = (scores["tg"] + scores["egc"]) / 2
