@@ -51,50 +51,53 @@ A from-scratch GNN, even using a public reference implementation's *code*
 and training its weights fresh during the run, is fine. Pretrained
 chemistry-LM fine-tuning is fully off the table — don't suggest it.
 
-## Steps 1–4 status: DONE. Current pipeline state (as of latest run)
-The original workflow (data exploration → baseline → validation harness →
-feature engineering) is complete. scripts/baseline.py currently implements:
+## Current pipeline state (as of 2026-07-03)
+scripts/baseline.py currently implements:
 
-- **Features (~4487 pre-pruning, ~1857 post-pruning)**: RDKit descriptors
+- **Features (8,975 pre-pruning, 1,628 post-pruning)**: RDKit descriptors
   (~210), ECFP4 + ECFP6 Morgan fingerprints (2048 bits each), MACCS keys
   (167), 2 topology features (backbone span between `*` atoms), 5 electronic
-  features (aromatic ring count, aromatic atom fraction, rotatable bonds,
-  sp2 atom fraction, non-aromatic double bond count — chosen for Egc/band-gap
-  relevance via conjugation).
-- **Models**: LightGBM + XGBoost blend (currently naive 50/50 average —
-  under revision, see Tier 1 below), each tuned separately per target
-  (Tg, Egc) via Optuna.
+  features, 1 Tg-specific feature (backbone_rotatable_bonds — monomer only),
+  1 conjugation feature (max_conjugation_path — monomer + chain) — ALL
+  computed on BOTH the monomer SMILES and a trimer chain (3 repeat units
+  stitched together via `*` attachment points). No topology features on chain
+  (no `*` atoms after capping). ~62/6165 train SMILES fail chain building
+  and fall back to monomer features.
+- **Pruning**: Permutation importance (replaces gain-importance). 300-tree
+  probe on fold 0, keeps features with positive permutation importance on val
+  set. TG kept 1,228 / 8,975; EGC kept 672 / 8,975; union = 1,628. Unbiased
+  vs fingerprint bits unlike gain importance.
+- **Models**: LightGBM + XGBoost blend, each tuned separately per target
+  (Tg, Egc) via Optuna (30 LGB trials / 10 XGB trials). Blend weights are
+  fitted per target via OOF grid search (w∈{0.1…0.9}).
 - **Validation**: 5-fold StratifiedGroupKFold, grouped by *canonicalized*
-  SMILES (important: ~70% of raw train.csv SMILES are non-canonical —
-  canonicalize before grouping or CV leaks), stratified by target_type.
-- **Robustness**: None-guards on all RDKit parse calls (0 unparseable SMILES
-  confirmed in current train/test), float32 cast to catch RDKit Ipc
-  descriptor overflow before it silently becomes inf and crashes XGBoost.
-- **Known data quality issue**: 6 duplicate (canonical SMILES, target_type)
-  groups exist, all in Tg. 5 have small spread (a few °C, likely measurement
-  noise); 1 has a 24°C spread (smiles starting
-  `*C(=O)Nc1ccc(Oc2ccc(-c3ccc(Oc4ccc(NC(=O)c5ccc6c(c5` — worth resolving,
-  e.g. mean-merging duplicates, see Tier 1).
-- **Tg log-transform**: implemented (log1p with offset=119 to handle
-  negative Tg values down to -118°C) but NOT YET CONFIRMED to actually help
-  — see "Known score history" below. May be kept or reverted based on
-  results.
+  SMILES (~70% of raw train.csv SMILES are non-canonical — must canonicalize
+  before grouping or CV leaks), stratified by target_type.
+- **Pre-processing**: 6 duplicate (canon SMILES, target_type) groups
+  mean-merged before feature extraction (all Tg, spreads 4.9–24°C).
+- **Tg log-transform**: REVERTED. Tested and confirmed to hurt Tg R²
+  (-0.007 vs benchmark). No transform in current code.
+- **Robustness**: None-guards on all RDKit parse calls, float32 cast to
+  catch RDKit Ipc descriptor overflow before XGBoost crashes.
 
 ## Known score history (use to judge whether a change is a real improvement)
-- **0.8987** — first well-tuned, trustworthy number. Single model (LGB
-  only), 20 real Optuna trials, RDKit descriptors + Morgan(ECFP4) + MACCS +
-  topology only (no electronic features, no log-transform, no blend).
-  R²(Tg)=0.8925, R²(Egc)=0.9049. **This is the benchmark to beat.**
-- All LGB+XGB blend runs so far were confounded by either (a) N_TRIALS
-  accidentally left at a smoke-test value (2), or (b) not yet having fitted
-  blend weights / resolved duplicates / settled the log-transform question.
-  Treat any blend-era CV number as provisional until a run completes with
-  N_TRIALS=30, N_XGB_TRIALS=10 AND Tier 1 fixes applied.
-- **Observed fold-to-fold noise floor**: Tg fold std has ranged 0.0063–0.0144
-  across different runs. Differences smaller than ~0.01–0.02 in overall mean
-  R² between two runs may not be reliably distinguishable from CV noise on a
-  single seed. Don't over-interpret small deltas without multi-seed CV
-  (averaging across 2-3 different fold-split random seeds) to confirm.
+- **0.8987** — first well-tuned number. Single LGB, 20 trials, no blend,
+  no chain. R²(Tg)=0.8925, R²(Egc)=0.9049.
+- **0.8978** — LGB+XGB blend, 30/10 trials, WITH log-transform, no chain.
+  Log-transform hurt Tg (0.8918 vs 0.8925).
+- **0.9052 CV / 0.894 Kaggle** — LGB+XGB blend, 30/10 trials, NO
+  log-transform, WITH chain extension (trimer), dedup merge, fitted blend
+  weights, gain-importance pruning (2,952 features). R²(Tg)=0.9050,
+  R²(Egc)=0.9055. Blend weights: TG=50/50, EGC=0.4 LGB/0.6 XGB.
+- **0.9073 CV / ~0.896 Kaggle (est.)** — current best. Same as above but
+  WITH backbone_rotatable_bonds + max_conjugation_path features AND
+  permutation importance pruning (1,628 features). R²(Tg)=0.9062 (+0.0012),
+  R²(Egc)=0.9084 (+0.0029). Blend weights: TG=0.2 LGB/0.8 XGB, EGC=0.3
+  LGB/0.7 XGB. Egc fold std=0.0174. Runtime: 4:50. CV-to-Kaggle gap: ~0.011
+  (consistent across runs — likely distribution shift).
+- **Observed fold-to-fold noise floor**: Tg std ~0.007, Egc std ~0.015.
+  Differences < 0.01–0.02 in mean R² may not be reliably distinguishable
+  from CV noise on a single seed.
 
 ## Hard-learned operational rules — follow these strictly
 1. **Before running anything with a long expected runtime, print/confirm the
@@ -155,43 +158,20 @@ calibrate expectations rather than assume 0.93 is reachable by default:
   remaining gap may reflect real label-measurement noise, not a fixable
   modeling gap — can't confirm this for our specific dataset, but it's a
   documented issue in this exact problem domain.
-- **New idea, borrowed from a top solution on the related competition**:
-  "chain extension" — instead of computing features on a single repeat
-  unit, bond 2-3 copies of the repeat unit together (via the `*` attachment
-  points) before running RDKit/fingerprint feature extraction. Real
-  polymers are long chains; a single repeat unit may not fully capture
-  backbone flexibility (Tg-relevant) or conjugation length (Egc-relevant)
-  that only emerges over a longer stretch. Not yet implemented — high
-  priority.
-
-## IMPORTANT correction: Tier 1 is NOT actually complete
-Earlier notes assumed Tier 1 (fit blend weights, merge duplicate labels,
-settle log-transform) was done. Checking the actual current script:
-duplicates are only detected/printed, NOT merged; the LGB/XGB blend is
-still a naive 50/50 average, NOT fitted weights. Do not treat any CV score
-from the current script as reflecting a completed Tier 1 — finish these
-first before judging headroom or trying further ideas.
+- **Chain extension (DONE)**: stitching 3 repeat units together before feature
+  extraction. Drove Tg R² from 0.8925 → 0.9050 (+0.0125). Implemented via
+  `_build_chain()` in baseline.py — connects units via `*` attachment points,
+  removes junction `*` atoms, caps terminals with implicit H.
 
 ## Prioritized idea list for further score improvement (current plan)
-- **0 (do first)**: actually complete Tier 1 — fit blend weights per target
-  (e.g. small Ridge meta-model on out-of-fold LGB+XGB predictions, or grid
-  search over blend weight, per target since Tg/Egc will likely differ);
-  mean-merge the 6 duplicate-label groups; confirm log-transform keep/revert
-  decision against the 0.8987 single-model benchmark with a real (non-smoke-
-  test) trial count.
-- **1**: chain-extension features (see above) — likely highest-value single
-  addition given it's untried and grounded in a real winning solution.
-- **2**: Tg-specific features — H-bond donor/acceptor count (raises Tg via
-  chain-chain interaction strength), backbone-path-only rotatable bond count
-  (more precise rigidity signal than current whole-molecule topology
-  features); true conjugation-path-length graph feature for Egc (longest
-  unbroken conjugated path, not just aromatic/sp2 counts — more faithful to
-  Hückel-theory band gap reasoning than current proxies).
-- **3**: switch feature pruning from LGB gain-importance (biased against
-  sparse fingerprint bits) to permutation importance.
-- **4**: multi-seed CV (2-3 different fold-split seeds, averaged) — required
-  before trusting whether any of the above are real improvements vs. noise,
-  given the observed 0.006-0.014 fold std.
+- **DONE**: Tier 1 (dedup merge, fitted blend weights, log-transform reverted).
+- **DONE**: Chain extension (trimer). Drove Tg from 0.8925 → 0.9050.
+- **DONE**: backbone_rotatable_bonds + max_conjugation_path + permutation
+  importance pruning. Drove CV from 0.9052 → 0.9073 (+0.0021). Egc gained
+  more (+0.0029) than Tg (+0.0012) — max_conjugation_path working as
+  expected. Feature count dropped 2,952 → 1,628 and model improved.
+- **Next**: multi-seed CV (2-3 seeds averaged) — required to confirm whether
+  any future change is real vs. fold-noise, given Egc std=0.0174.
 - **Deferred**: GNN (self-supervised + multi-task), see above. CatBoost /
   third ensemble member explicitly rejected as low-margin.
 

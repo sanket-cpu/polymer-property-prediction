@@ -9,6 +9,9 @@ polymer-property-prediction/
 # Generated outputs
 outputs/
 
+# Run logs
+logs/
+
 # Jupyter
 .ipynb_checkpoints/
 

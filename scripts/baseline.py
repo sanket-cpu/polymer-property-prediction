@@ -16,6 +16,7 @@ Run from project root:
 Output: outputs/submission.csv
 """
 
+import os
 import sys
 from datetime import datetime
 
@@ -26,11 +27,35 @@ from joblib import Parallel, delayed
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, Descriptors, MACCSkeys, rdMolDescriptors
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import r2_score
 from sklearn.model_selection import StratifiedGroupKFold
 from xgboost import XGBRegressor
 
-sys.stdout.reconfigure(line_buffering=True)
+# Force UTF-8 on the terminal — reconfigure() is unreliable on Windows;
+# wrapping the raw buffer directly is the guaranteed approach.
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+
+# Tee all stdout to a timestamped log file
+os.makedirs("logs", exist_ok=True)
+_log_path = f"logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+_log_fh   = open(_log_path, "w", encoding="utf-8", buffering=1)
+
+class _Tee:
+    def __init__(self, terminal, logfile):
+        self.terminal = terminal
+        self.logfile  = logfile
+    def write(self, data):
+        self.terminal.write(data)
+        self.logfile.write(data)
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
+
+sys.stdout = _Tee(sys.stdout, _log_fh)  # type: ignore[assignment]
+print(f"Logging to {_log_path}\n")
+
 RDLogger.DisableLog("rdApp.*")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -139,6 +164,64 @@ def _electronic_one(smi):
         "num_nonarom_double_bonds": n_dbl,
     }
 
+def _tg_specific_one(smi):
+    """
+    Backbone-path rotatable bond count: single non-ring bonds on the shortest
+    path between the two * attachment points only. More precise Tg rigidity
+    signal than whole-molecule rotatable bond count — side chains that don't
+    affect backbone stiffness are excluded.
+    """
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return {"backbone_rotatable_bonds": np.nan}
+    star_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0]
+    if len(star_idx) != 2:
+        return {"backbone_rotatable_bonds": np.nan}
+    path = Chem.GetShortestPath(mol, star_idx[0], star_idx[1])
+    rot = 0
+    for i in range(len(path) - 1):
+        bond = mol.GetBondBetweenAtoms(path[i], path[i + 1])
+        if bond.GetBondTypeAsDouble() == 1.0 and not bond.IsInRing():
+            rot += 1
+    return {"backbone_rotatable_bonds": rot}
+
+
+def _conjugation_one(smi):
+    """
+    Largest sp2-connected component size: number of sp2 atoms in the largest
+    contiguous π-conjugated subgraph. More faithful to Hückel-theory band gap
+    physics than sp2 fraction — two molecules with the same sp2 fraction but
+    different conjugation topology (isolated double bonds vs long conjugated
+    backbone) have very different Egc values.
+    """
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return {"max_conjugation_path": np.nan}
+    sp2 = {
+        a.GetIdx() for a in mol.GetAtoms()
+        if a.GetHybridization() == Chem.rdchem.HybridizationType.SP2
+    }
+    if not sp2:
+        return {"max_conjugation_path": 0}
+    visited, max_comp = set(), 0
+    for start in sp2:
+        if start in visited:
+            continue
+        comp, stack = set(), [start]
+        while stack:
+            node = stack.pop()
+            if node in comp:
+                continue
+            comp.add(node)
+            for bond in mol.GetAtomWithIdx(node).GetBonds():
+                nbr = bond.GetOtherAtomIdx(node)
+                if nbr in sp2 and nbr not in comp:
+                    stack.append(nbr)
+        visited |= comp
+        max_comp = max(max_comp, len(comp))
+    return {"max_conjugation_path": max_comp}
+
+
 def _build_chain(smi, n_units=N_CHAIN_UNITS):
     """
     Stitch n_units copies of a linear polymer repeat unit via * attachment points.
@@ -203,38 +286,44 @@ def compute_features(df):
         print(f"    Chain build failures: {n_fail}/{len(smiles)} (fell back to monomer)")
 
     # Monomer features
-    descs  = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s)       for s in smiles)
-    ecfp4  = Parallel(n_jobs=-1, prefer="threads")(delayed(_ecfp4_one)(s)      for s in smiles)
-    ecfp6  = Parallel(n_jobs=-1, prefer="threads")(delayed(_ecfp6_one)(s)      for s in smiles)
-    maccs  = Parallel(n_jobs=-1, prefer="threads")(delayed(_maccs_one)(s)      for s in smiles)
-    topo   = Parallel(n_jobs=-1, prefer="threads")(delayed(_topo_one)(s)       for s in smiles)
-    elec   = Parallel(n_jobs=-1, prefer="threads")(delayed(_electronic_one)(s) for s in smiles)
+    descs  = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s)        for s in smiles)
+    ecfp4  = Parallel(n_jobs=-1, prefer="threads")(delayed(_ecfp4_one)(s)       for s in smiles)
+    ecfp6  = Parallel(n_jobs=-1, prefer="threads")(delayed(_ecfp6_one)(s)       for s in smiles)
+    maccs  = Parallel(n_jobs=-1, prefer="threads")(delayed(_maccs_one)(s)       for s in smiles)
+    topo   = Parallel(n_jobs=-1, prefer="threads")(delayed(_topo_one)(s)        for s in smiles)
+    elec   = Parallel(n_jobs=-1, prefer="threads")(delayed(_electronic_one)(s)  for s in smiles)
+    tgfeat = Parallel(n_jobs=-1, prefer="threads")(delayed(_tg_specific_one)(s) for s in smiles)
+    conj   = Parallel(n_jobs=-1, prefer="threads")(delayed(_conjugation_one)(s) for s in smiles)
 
-    # Chain features (trimer) — no topology since chain has no * atoms
+    # Chain features (trimer) — no topology or tg_specific (needs * atoms)
     ch_descs = Parallel(n_jobs=-1, prefer="threads")(delayed(_desc_one)(s)       for s in chain_smi)
     ch_ecfp4 = Parallel(n_jobs=-1, prefer="threads")(delayed(_ecfp4_one)(s)      for s in chain_smi)
     ch_ecfp6 = Parallel(n_jobs=-1, prefer="threads")(delayed(_ecfp6_one)(s)      for s in chain_smi)
     ch_maccs = Parallel(n_jobs=-1, prefer="threads")(delayed(_maccs_one)(s)      for s in chain_smi)
     ch_elec  = Parallel(n_jobs=-1, prefer="threads")(delayed(_electronic_one)(s) for s in chain_smi)
+    ch_conj  = Parallel(n_jobs=-1, prefer="threads")(delayed(_conjugation_one)(s) for s in chain_smi)
 
     p = f"ch{N_CHAIN_UNITS}_"
 
-    desc_df  = pd.DataFrame(descs,  index=df.index)
-    ecfp4_df = pd.DataFrame(ecfp4,  index=df.index, columns=[f"ecfp4_{i}" for i in range(2048)])
-    ecfp6_df = pd.DataFrame(ecfp6,  index=df.index, columns=[f"ecfp6_{i}" for i in range(2048)])
-    maccs_df = pd.DataFrame(maccs,  index=df.index, columns=[f"maccs_{i}" for i in range(167)])
-    topo_df  = pd.DataFrame(topo,   index=df.index)
-    elec_df  = pd.DataFrame(elec,   index=df.index)
+    desc_df   = pd.DataFrame(descs,   index=df.index)
+    ecfp4_df  = pd.DataFrame(ecfp4,   index=df.index, columns=[f"ecfp4_{i}" for i in range(2048)])
+    ecfp6_df  = pd.DataFrame(ecfp6,   index=df.index, columns=[f"ecfp6_{i}" for i in range(2048)])
+    maccs_df  = pd.DataFrame(maccs,   index=df.index, columns=[f"maccs_{i}" for i in range(167)])
+    topo_df   = pd.DataFrame(topo,    index=df.index)
+    elec_df   = pd.DataFrame(elec,    index=df.index)
+    tgfeat_df = pd.DataFrame(tgfeat,  index=df.index)
+    conj_df   = pd.DataFrame(conj,    index=df.index)
 
-    ch_desc_df = pd.DataFrame(ch_descs, index=df.index).add_prefix(p)
+    ch_desc_df  = pd.DataFrame(ch_descs, index=df.index).add_prefix(p)
     ch_ecfp4_df = pd.DataFrame(ch_ecfp4, index=df.index, columns=[f"{p}ecfp4_{i}" for i in range(2048)])
     ch_ecfp6_df = pd.DataFrame(ch_ecfp6, index=df.index, columns=[f"{p}ecfp6_{i}" for i in range(2048)])
     ch_maccs_df = pd.DataFrame(ch_maccs, index=df.index, columns=[f"{p}maccs_{i}" for i in range(167)])
     ch_elec_df  = pd.DataFrame(ch_elec,  index=df.index).add_prefix(p)
+    ch_conj_df  = pd.DataFrame(ch_conj,  index=df.index).add_prefix(p)
 
     combined = pd.concat([
-        desc_df, ecfp4_df, ecfp6_df, maccs_df, topo_df, elec_df,
-        ch_desc_df, ch_ecfp4_df, ch_ecfp6_df, ch_maccs_df, ch_elec_df,
+        desc_df, ecfp4_df, ecfp6_df, maccs_df, topo_df, elec_df, tgfeat_df, conj_df,
+        ch_desc_df, ch_ecfp4_df, ch_ecfp6_df, ch_maccs_df, ch_elec_df, ch_conj_df,
     ], axis=1)
     # Cast to float32 first: RDKit's Ipc descriptor can exceed float32 max (~3.4e38),
     # which overflows silently to inf when XGBoost casts internally, crashing QuantileDMatrix.
@@ -317,22 +406,37 @@ cv_splits = list(sgkf.split(X_train, strat_label, groups))
 # is a different quantity than on 1500 — they are not interchangeable.
 
 print(f"\n{'='*60}")
-print(f"  FEATURE PRUNING  ({PROBE_N_ESTIMATORS}-tree probe, before tuning)")
+print(f"  FEATURE PRUNING  ({PROBE_N_ESTIMATORS}-tree probe, permutation importance)")
 print(f"{'='*60}\n")
 
-n_orig    = X_train.shape[1]
+n_orig = X_train.shape[1]
 keep_cols = set()
+# Use fold 0 train/val split for the probe — avoids fitting on all data
+probe_tr_idx, probe_val_idx = cv_splits[0]
 for ttype in ["tg", "egc"]:
-    mask  = strat_label == ttype
+    mask_tr  = strat_label[probe_tr_idx]  == ttype
+    mask_val = strat_label[probe_val_idx] == ttype
+    X_probe_tr  = X_train.iloc[probe_tr_idx][mask_tr]
+    X_probe_val = X_train.iloc[probe_val_idx][mask_val]
+    y_probe_tr  = y_train[probe_tr_idx][mask_tr]
+    y_probe_val = y_train[probe_val_idx][mask_val]
+
     probe = LGBMRegressor(
         n_estimators=PROBE_N_ESTIMATORS, num_leaves=63,
         random_state=SEED, n_jobs=-1, verbose=-1,
     )
-    probe.fit(X_train[mask], y_train[mask])
-    imp     = pd.Series(probe.feature_importances_, index=X_train.columns)
-    nonzero = imp[imp > 0].index
-    keep_cols.update(nonzero)
-    print(f"  {ttype.upper()}: {len(nonzero):,} / {n_orig:,} features used")
+    probe.fit(X_probe_tr, y_probe_tr)
+
+    # Permutation importance: unbiased towards feature cardinality, unlike
+    # gain importance which systematically undervalues sparse fingerprint bits
+    result   = permutation_importance(
+        probe, X_probe_val, y_probe_val,
+        n_repeats=1, random_state=SEED, n_jobs=-1,
+    )
+    imp      = pd.Series(result.importances_mean, index=X_train.columns)
+    positive = imp[imp > 0].index
+    keep_cols.update(positive)
+    print(f"  {ttype.upper()}: {len(positive):,} / {n_orig:,} features with positive permutation importance")
 
 keep_cols = sorted(keep_cols)
 X_train   = X_train[keep_cols]
