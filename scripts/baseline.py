@@ -25,6 +25,7 @@ from datetime import datetime
 import numpy as np
 import optuna
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from joblib import Parallel, delayed
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 from rdkit import Chem, RDLogger
@@ -33,6 +34,8 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import r2_score
 from sklearn.model_selection import StratifiedGroupKFold
 from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+from sklearn.linear_model import RidgeCV
 
 # Force UTF-8 on the terminal — reconfigure() is unreliable on Windows;
 # wrapping the raw buffer directly is the guaranteed approach.
@@ -68,12 +71,24 @@ SEED        = 42
 SEEDS       = [42, 0, 123]  # seeds for multi-seed prediction averaging; set to [42] for a single run
 
 EARLY_STOPPING_ROUNDS = 50
-N_TRIALS              = 30  # LGB Optuna trials per target; set to 2 for a quick smoke-test
+N_TRIALS              = 20  # LGB Optuna trials per target; set to 2 for a quick smoke-test
 N_XGB_TRIALS          = 10  # XGB Optuna trials per target
+N_CAT_TRIALS          = 10  # CatBoost Optuna trials per target
 TUNE_N_ESTIMATORS     = 1000
 FINAL_N_ESTIMATORS    = 3000
 PROBE_N_ESTIMATORS    = 300
 N_CHAIN_UNITS         = 3   # repeat units to stitch for chain-extension features
+
+# Parallelism — no algorithm change, pure wall-clock speedup.
+# Tuning: all 6 studies (3 models × 2 targets) run simultaneously; each study
+#         evaluates N_OPTUNA_JOBS trials in parallel → 6*N_OPTUNA_JOBS concurrent fits.
+# Final CV: all N_FOLDS*2 (fold, target) tasks run simultaneously.
+N_OPTUNA_JOBS  = 2
+_N_CPU         = os.cpu_count() or 1
+_N_TUNE_CONC   = 3 * 2 * N_OPTUNA_JOBS   # 3 models × 2 targets × parallel trials
+_N_CV_CONC     = N_FOLDS * 2              # 5 folds × 2 targets
+_TUNE_N_JOBS   = max(1, _N_CPU // _N_TUNE_CONC)
+_FINAL_N_JOBS  = max(1, _N_CPU // _N_CV_CONC)
 
 LGB_FIXED = {
     "n_estimators" : FINAL_N_ESTIMATORS,
@@ -89,6 +104,15 @@ XGB_FIXED = {
     "n_jobs"       : -1,
     "tree_method"  : "hist",
     "device"       : "cpu",
+}
+
+# CatBoost uses random_seed (not random_state) and thread_count (not n_jobs)
+CAT_FIXED = {
+    "n_estimators"         : FINAL_N_ESTIMATORS,
+    "random_seed"          : SEED,
+    "verbose"              : 0,
+    "thread_count"         : -1,
+    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
 }
 
 
@@ -410,10 +434,13 @@ all_seed_test_tg  = []
 all_seed_test_egc = []
 seed_cv_scores    = []
 
-print(f"\nMulti-seed run: SEEDS={SEEDS}  N_TRIALS={N_TRIALS}  N_XGB_TRIALS={N_XGB_TRIALS}")
-# Calibrated from observed runtimes: features ~20 min (once), then per seed:
-#   pruning + CV folds ~80 min (constant), LGB tuning ~5 min/trial, XGB ~5 min/trial
-_per_seed_hr = (80 + N_TRIALS * 5 + N_XGB_TRIALS * 5) / 60
+print(f"\nMulti-seed run: SEEDS={SEEDS}  N_TRIALS={N_TRIALS}  N_XGB_TRIALS={N_XGB_TRIALS}  N_CAT_TRIALS={N_CAT_TRIALS}")
+# Runtime breakdown (per seed, post-parallelisation):
+#   pruning:  ~20 min  (n_repeats=3, ~2× vs n_repeats=1)
+#   final CV: ~50 min  (3 models, Tg+Egc parallel per fold)
+#   tuning:   (N_TRIALS*5 + N_XGB_TRIALS*5 + N_CAT_TRIALS*5) / (2*N_OPTUNA_JOBS) min
+_tune_factor = 2 * N_OPTUNA_JOBS
+_per_seed_hr = (70 + (N_TRIALS * 5 + N_XGB_TRIALS * 5 + N_CAT_TRIALS * 5) / _tune_factor) / 60
 _est_hr      = 0.33 + len(SEEDS) * _per_seed_hr
 print(f"Estimated runtime: ~{_est_hr:.1f} hours\n")
 
@@ -425,9 +452,10 @@ for run_idx, run_seed in enumerate(SEEDS):
     print(f"  RUN {run_idx + 1}/{len(SEEDS)}  (seed={run_seed})")
     print(f"{'#'*60}")
 
-    # Override random_state with this seed in both model configs
+    # Override random seed with this run's seed in all model configs
     _lgb_fixed = {**LGB_FIXED, "random_state": run_seed}
     _xgb_fixed = {**XGB_FIXED, "random_state": run_seed}
+    _cat_fixed = {**CAT_FIXED, "random_seed":  run_seed}
 
     sgkf      = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=run_seed)
     cv_splits = list(sgkf.split(X_train_full, strat_label, groups))
@@ -441,41 +469,45 @@ for run_idx, run_seed in enumerate(SEEDS):
     print(f"  FEATURE PRUNING  ({PROBE_N_ESTIMATORS}-tree probe, permutation importance)")
     print(f"{'='*60}\n")
 
-    n_orig    = X_train_full.shape[1]
-    keep_cols = set()
+    n_orig = X_train_full.shape[1]
     probe_tr_idx, probe_val_idx = cv_splits[0]
-    for ttype in ["tg", "egc"]:
+    _probe_jobs = max(1, _N_CPU // 2)  # 2 probes run in parallel, split CPUs
+
+    def _prune_for_ttype(ttype):
         mask_tr  = strat_label[probe_tr_idx]  == ttype
         mask_val = strat_label[probe_val_idx] == ttype
         X_probe_tr  = X_train_full.iloc[probe_tr_idx][mask_tr]
         X_probe_val = X_train_full.iloc[probe_val_idx][mask_val]
         y_probe_tr  = y_train[probe_tr_idx][mask_tr]
         y_probe_val = y_train[probe_val_idx][mask_val]
-
         probe = LGBMRegressor(
             n_estimators=PROBE_N_ESTIMATORS, num_leaves=63,
-            random_state=run_seed, n_jobs=-1, verbose=-1,
+            random_state=run_seed, n_jobs=_probe_jobs, verbose=-1,
         )
         probe.fit(X_probe_tr, y_probe_tr)
-
         result = permutation_importance(
             probe, X_probe_val, y_probe_val,
-            n_repeats=1, random_state=run_seed, n_jobs=-1,
+            n_repeats=3, random_state=run_seed, n_jobs=_probe_jobs,
         )
         imp      = pd.Series(result.importances_mean, index=X_train_full.columns)
         positive = imp[imp > 0].index
-        keep_cols.update(positive)
         print(f"  {ttype.upper()}: {len(positive):,} / {n_orig:,} features with positive permutation importance")
+        return set(positive.tolist())
+
+    keep_cols = set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for cols in pool.map(_prune_for_ttype, ["tg", "egc"]):
+            keep_cols.update(cols)
 
     keep_cols = sorted(keep_cols)
     X_train   = X_train_full[keep_cols]
     X_test    = X_test_full[keep_cols]
     print(f"\n  Kept {len(keep_cols):,} features, dropped {n_orig - len(keep_cols):,} zero-importance")
 
-    # ── LGB tuning ─────────────────────────────────────────────────────────────
+    # ── All model tuning in parallel (LGB + XGB + CAT × TG + EGC = 6 studies) ──
 
     print(f"\n{'='*60}")
-    print(f"  LGB TUNING  ({N_TRIALS} trials per target)")
+    print(f"  TUNING  LGB({N_TRIALS}) + XGB({N_XGB_TRIALS}) + CAT({N_CAT_TRIALS}) trials  |  6 studies concurrently")
     print(f"{'='*60}")
 
     # Default-argument capture avoids closure-in-loop bugs for the seed-local variables
@@ -485,6 +517,7 @@ for run_idx, run_seed in enumerate(SEEDS):
             params = {
                 **_fixed,
                 "n_estimators"     : TUNE_N_ESTIMATORS,
+                "n_jobs"           : _TUNE_N_JOBS,
                 "num_leaves"       : trial.suggest_int("num_leaves", 15, 255),
                 "learning_rate"    : trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
                 "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
@@ -513,30 +546,13 @@ for run_idx, run_seed in enumerate(SEEDS):
             return np.mean(scores)
         return objective
 
-    best_lgb_params = {}
-    for ttype in ["tg", "egc"]:
-        print(f"\n  Tuning LGB {ttype.upper()}...")
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=run_seed),
-        )
-        study.optimize(make_lgb_objective(ttype), n_trials=N_TRIALS, show_progress_bar=False)
-        best_lgb_params[ttype] = {**_lgb_fixed, **study.best_params}
-        print(f"  Best R²({ttype.upper()}) = {study.best_value:+.4f}")
-        print(f"  Best params: {study.best_params}")
-
-    # ── XGB tuning ─────────────────────────────────────────────────────────────
-
-    print(f"\n{'='*60}")
-    print(f"  XGB TUNING  ({N_XGB_TRIALS} trials per target)")
-    print(f"{'='*60}")
-
     def make_xgb_objective(ttype, _cv=cv_splits, _X=X_train, _y=y_train,
                            _sl=strat_label, _fixed=_xgb_fixed):
         def objective(trial):
             params = {
                 **_fixed,
                 "n_estimators"    : TUNE_N_ESTIMATORS,
+                "n_jobs"          : _TUNE_N_JOBS,
                 "max_depth"       : trial.suggest_int("max_depth", 3, 8),
                 "learning_rate"   : trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
                 "subsample"       : trial.suggest_float("subsample", 0.5, 1.0),
@@ -560,111 +576,194 @@ for run_idx, run_seed in enumerate(SEEDS):
             return np.mean(scores)
         return objective
 
-    best_xgb_params = {}
-    for ttype in ["tg", "egc"]:
-        print(f"\n  Tuning XGB {ttype.upper()}...")
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=run_seed),
-        )
-        study.optimize(make_xgb_objective(ttype), n_trials=N_XGB_TRIALS, show_progress_bar=False)
-        best_xgb_params[ttype] = {**_xgb_fixed, **study.best_params}
-        print(f"  Best R²({ttype.upper()}) = {study.best_value:+.4f}")
-        print(f"  Best params: {study.best_params}")
+    def make_cat_objective(ttype, _cv=cv_splits, _X=X_train, _y=y_train,
+                           _sl=strat_label, _fixed=_cat_fixed):
+        def objective(trial):
+            params = {
+                **_fixed,
+                "n_estimators"     : TUNE_N_ESTIMATORS,
+                "thread_count"     : _TUNE_N_JOBS,
+                "depth"            : trial.suggest_int("depth", 4, 8),
+                "learning_rate"    : trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "l2_leaf_reg"      : trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+                "rsm"              : trial.suggest_float("rsm", 0.4, 1.0),
+                "min_data_in_leaf" : trial.suggest_int("min_data_in_leaf", 1, 50),
+            }
+            scores = []
+            for tr_idx, val_idx in _cv:
+                mask_tr  = _sl[tr_idx]  == ttype
+                mask_val = _sl[val_idx] == ttype
+                X_tr  = _X.iloc[tr_idx][mask_tr]
+                X_val = _X.iloc[val_idx][mask_val]
+                y_tr  = _y[tr_idx][mask_tr]
+                y_val = _y[val_idx][mask_val]
+                model = CatBoostRegressor(**params)
+                model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
+                pred = model.predict(X_val)
+                scores.append(r2_score(y_val, pred))
+            return np.mean(scores)
+        return objective
+
+    _make_obj  = {"lgb": make_lgb_objective, "xgb": make_xgb_objective, "cat": make_cat_objective}
+    _n_trials  = {"lgb": N_TRIALS, "xgb": N_XGB_TRIALS, "cat": N_CAT_TRIALS}
+    _fix_map   = {"lgb": _lgb_fixed, "xgb": _xgb_fixed, "cat": _cat_fixed}
+
+    def _run_study(args):
+        model, ttype = args
+        s = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=run_seed))
+        s.optimize(_make_obj[model](ttype), n_trials=_n_trials[model],
+                   n_jobs=N_OPTUNA_JOBS, show_progress_bar=False)
+        return model, ttype, s.best_value, {**_fix_map[model], **s.best_params}
+
+    print(f"\n  Running 6 studies concurrently ({N_OPTUNA_JOBS} trial threads each)...")
+    best_lgb_params: dict = {}
+    best_xgb_params: dict = {}
+    best_cat_params: dict = {}
+    _dest = {"lgb": best_lgb_params, "xgb": best_xgb_params, "cat": best_cat_params}
+    tune_tasks = [(m, t) for m in ["lgb", "xgb", "cat"] for t in ["tg", "egc"]]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for model, ttype, best_val, best_params in pool.map(_run_study, tune_tasks):
+            _dest[model][ttype] = best_params
+            print(f"  {model.upper()} {ttype.upper()}: Best R²={best_val:+.4f}  params={best_params}")
 
     # ── Final CV: score + accumulate fold-ensembled test predictions ───────────
 
     print(f"\n{'='*60}")
-    print(f"  FINAL CV  (LGB+XGB blend)  +  FOLD-ENSEMBLED TEST PREDICTIONS")
+    print(f"  FINAL CV  (LGB+XGB+CAT)  +  FOLD-ENSEMBLED TEST PREDICTIONS")
     print(f"{'='*60}\n")
 
     test_pred_lgb  = {ttype: np.zeros(len(subset)) for ttype, subset in test_subsets.items()}
     test_pred_xgb  = {ttype: np.zeros(len(subset)) for ttype, subset in test_subsets.items()}
+    test_pred_cat  = {ttype: np.zeros(len(subset)) for ttype, subset in test_subsets.items()}
     fold_lgb_preds = {"tg": [], "egc": []}
     fold_xgb_preds = {"tg": [], "egc": []}
+    fold_cat_preds = {"tg": [], "egc": []}
     fold_y_vals    = {"tg": [], "egc": []}
 
-    for fold, (tr_idx, val_idx) in enumerate(cv_splits, 1):
-        types_tr  = strat_label[tr_idx]
-        types_val = strat_label[val_idx]
+    def _fit_fold_ttype(args):
+        fold_idx, ttype = args
+        tr_idx, val_idx = cv_splits[fold_idx]
+        mask_tr  = strat_label[tr_idx]  == ttype
+        mask_val = strat_label[val_idx] == ttype
+        X_tr  = X_train.iloc[tr_idx][mask_tr]
+        X_val = X_train.iloc[val_idx][mask_val]
+        y_tr  = y_train[tr_idx][mask_tr]
+        y_val = y_train[val_idx][mask_val]
+        X_test_sub = X_test.loc[test_subsets[ttype].index]
 
-        scores = {}
-        for ttype in ["tg", "egc"]:
-            mask_tr  = types_tr  == ttype
-            mask_val = types_val == ttype
-            X_tr  = X_train.iloc[tr_idx][mask_tr]
-            X_val = X_train.iloc[val_idx][mask_val]
-            y_tr  = y_train[tr_idx][mask_tr]
-            y_val = y_train[val_idx][mask_val]
-            X_test_sub = X_test.loc[test_subsets[ttype].index]
+        lgb_model = LGBMRegressor(**{**best_lgb_params[ttype], "n_jobs": _FINAL_N_JOBS})
+        lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
+                      callbacks=[early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), log_evaluation(0)])
 
-            lgb_model = LGBMRegressor(**best_lgb_params[ttype])
-            lgb_model.fit(
-                X_tr, y_tr,
-                eval_set=[(X_val, y_val)],
-                callbacks=[early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), log_evaluation(0)],
-            )
+        xgb_model = XGBRegressor(**{**best_xgb_params[ttype], "n_jobs": _FINAL_N_JOBS},
+                                  early_stopping_rounds=EARLY_STOPPING_ROUNDS)
+        xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
 
-            xgb_model = XGBRegressor(**best_xgb_params[ttype], early_stopping_rounds=EARLY_STOPPING_ROUNDS)
-            xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        cat_model = CatBoostRegressor(**{**best_cat_params[ttype], "thread_count": _FINAL_N_JOBS})
+        cat_model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
 
-            lgb_val  = lgb_model.predict(X_val)
-            xgb_val  = xgb_model.predict(X_val)
-            lgb_test = lgb_model.predict(X_test_sub)
-            xgb_test = xgb_model.predict(X_test_sub)
+        lgb_val  = lgb_model.predict(X_val)
+        xgb_val  = xgb_model.predict(X_val)
+        cat_val  = cat_model.predict(X_val)
+        lgb_test = lgb_model.predict(X_test_sub)
+        xgb_test = xgb_model.predict(X_test_sub)
+        cat_test = cat_model.predict(X_test_sub)
+        return fold_idx, ttype, lgb_val, xgb_val, cat_val, lgb_test, xgb_test, cat_test, y_val
 
-            scores[ttype] = r2_score(y_val, (lgb_val + xgb_val) / 2)  # naive 50/50 for per-fold print
+    print(f"  Running all {N_FOLDS * 2} (fold, target) tasks concurrently...")
+    cv_tasks    = [(fi, tt) for fi in range(N_FOLDS) for tt in ["tg", "egc"]]
+    fold_r2_log = {}   # fold_idx → {ttype → r2} for the per-fold summary print
+
+    with ThreadPoolExecutor(max_workers=N_FOLDS * 2) as pool:
+        for fold_idx, ttype, lgb_val, xgb_val, cat_val, lgb_test, xgb_test, cat_test, y_val in pool.map(_fit_fold_ttype, cv_tasks):
+            r2 = r2_score(y_val, (lgb_val + xgb_val + cat_val) / 3)
+            fold_r2_log.setdefault(fold_idx, {})[ttype] = r2
             fold_lgb_preds[ttype].append(lgb_val)
             fold_xgb_preds[ttype].append(xgb_val)
+            fold_cat_preds[ttype].append(cat_val)
             fold_y_vals[ttype].append(y_val)
             test_pred_lgb[ttype] += lgb_test
             test_pred_xgb[ttype] += xgb_test
+            test_pred_cat[ttype] += cat_test
 
-        mean = (scores["tg"] + scores["egc"]) / 2
-        print(f"  Fold {fold}  R²(Tg)={scores['tg']:+.4f}  R²(Egc)={scores['egc']:+.4f}  mean={mean:+.4f}  (naive 50/50)")
+    for fi in sorted(fold_r2_log):
+        s = fold_r2_log[fi]
+        mean = (s["tg"] + s["egc"]) / 2
+        print(f"  Fold {fi+1}  R²(Tg)={s['tg']:+.4f}  R²(Egc)={s['egc']:+.4f}  mean={mean:+.4f}  (naive equal-weight)")
 
-    # ── Blend weight search ────────────────────────────────────────────────────
+    # ── OOF stacking (RidgeCV meta-learner) ───────────────────────────────────
 
     print(f"\n{'='*60}")
-    print(f"  BLEND WEIGHT SEARCH  (grid w=0.1...0.9, step 0.1, all OOF)")
+    print(f"  OOF STACKING  (RidgeCV meta-learner, nested-fold evaluation)")
     print(f"{'='*60}\n")
 
-    blend_w = {}
-    for ttype in ["tg", "egc"]:
-        lgb_oof = np.concatenate(fold_lgb_preds[ttype])
-        xgb_oof = np.concatenate(fold_xgb_preds[ttype])
-        y_oof   = np.concatenate(fold_y_vals[ttype])
+    _RIDGE_ALPHAS = np.logspace(-3, 3, 25)
+    stacker    = {}   # final stackers for test predictions, keyed by ttype
+    nest_preds = {"tg": [], "egc": []}
+    nest_true  = {"tg": [], "egc": []}
 
-        naive_r2 = r2_score(y_oof, 0.5 * lgb_oof + 0.5 * xgb_oof)
-        best_w, best_r2 = 0.5, naive_r2
-        for w in np.round(np.arange(0.1, 1.0, 0.1), 1):
-            r2 = r2_score(y_oof, w * lgb_oof + (1.0 - w) * xgb_oof)
-            if r2 > best_r2:
-                best_r2, best_w = r2, float(w)
-        blend_w[ttype] = best_w
+    for ttype in ["tg", "egc"]:
+        lgb_parts = fold_lgb_preds[ttype]
+        xgb_parts = fold_xgb_preds[ttype]
+        cat_parts = fold_cat_preds[ttype]
+        y_parts   = fold_y_vals[ttype]
+
+        # Nested holdout: fit stacker on 4 folds, evaluate on the held-out fold
+        for hold in range(N_FOLDS):
+            tr_f = [i for i in range(N_FOLDS) if i != hold]
+            meta_X_tr = np.column_stack([
+                np.concatenate([lgb_parts[i] for i in tr_f]),
+                np.concatenate([xgb_parts[i] for i in tr_f]),
+                np.concatenate([cat_parts[i] for i in tr_f]),
+            ])
+            meta_y_tr  = np.concatenate([y_parts[i] for i in tr_f])
+            meta_X_val = np.column_stack([lgb_parts[hold], xgb_parts[hold], cat_parts[hold]])
+
+            ridge = RidgeCV(alphas=_RIDGE_ALPHAS)
+            ridge.fit(meta_X_tr, meta_y_tr)
+            nest_preds[ttype].append(ridge.predict(meta_X_val))
+            nest_true[ttype].append(y_parts[hold])
+
+        # Final stacker on ALL OOF — used only for weighting test predictions
+        all_X = np.column_stack([
+            np.concatenate(lgb_parts), np.concatenate(xgb_parts), np.concatenate(cat_parts),
+        ])
+        all_y = np.concatenate(y_parts)
+        ridge_final = RidgeCV(alphas=_RIDGE_ALPHAS)
+        ridge_final.fit(all_X, all_y)
+        stacker[ttype] = ridge_final
+        coef = ridge_final.coef_
         print(
-            f"  {ttype.upper()}: w(LGB)={best_w:.1f}  w(XGB)={(1.0 - best_w):.1f}"
-            f"  OOF R²={best_r2:+.4f}  naive 50/50: {naive_r2:+.4f}  delta={best_r2 - naive_r2:+.5f}"
+            f"  {ttype.upper()}: stacker coefs  LGB={coef[0]:.3f}  XGB={coef[1]:.3f}"
+            f"  CAT={coef[2]:.3f}  alpha={ridge_final.alpha_:.4g}"
         )
 
-    # Fold R² recomputed with optimal per-target blend weights
-    fold_r2_opt = {"tg": [], "egc": []}
+    # Honest nested-fold R²
+    fold_r2_stacked = {"tg": [], "egc": []}
     for ttype in ["tg", "egc"]:
-        for i in range(N_FOLDS):
-            pred = blend_w[ttype] * fold_lgb_preds[ttype][i] + (1.0 - blend_w[ttype]) * fold_xgb_preds[ttype][i]
-            fold_r2_opt[ttype].append(r2_score(fold_y_vals[ttype][i], pred))
+        for hold in range(N_FOLDS):
+            fold_r2_stacked[ttype].append(r2_score(nest_true[ttype][hold], nest_preds[ttype][hold]))
 
-    cv_tg  = np.mean(fold_r2_opt["tg"])
-    cv_egc = np.mean(fold_r2_opt["egc"])
+    cv_tg  = np.mean(fold_r2_stacked["tg"])
+    cv_egc = np.mean(fold_r2_stacked["egc"])
     cv_r2  = (cv_tg + cv_egc) / 2
 
-    print(f"\n  Mean R²(Tg)  = {cv_tg:+.4f}  (std {np.std(fold_r2_opt['tg']):.4f})")
-    print(f"  Mean R²(Egc) = {cv_egc:+.4f}  (std {np.std(fold_r2_opt['egc']):.4f})")
+    print(f"\n  Mean R²(Tg)  = {cv_tg:+.4f}  (std {np.std(fold_r2_stacked['tg']):.4f})")
+    print(f"  Mean R²(Egc) = {cv_egc:+.4f}  (std {np.std(fold_r2_stacked['egc']):.4f})")
     print(f"\n  >>> CV score (seed={run_seed}) = {cv_r2:+.4f} <<<")
 
-    # Collect blended, fold-averaged test predictions for this seed
-    seed_tg_pred  = (blend_w["tg"]  * test_pred_lgb["tg"]  + (1 - blend_w["tg"])  * test_pred_xgb["tg"])  / N_FOLDS
-    seed_egc_pred = (blend_w["egc"] * test_pred_lgb["egc"] + (1 - blend_w["egc"]) * test_pred_xgb["egc"]) / N_FOLDS
+    # Collect stacked, fold-averaged test predictions for this seed
+    seed_tg_pred  = stacker["tg"].predict(np.column_stack([
+        test_pred_lgb["tg"]  / N_FOLDS,
+        test_pred_xgb["tg"]  / N_FOLDS,
+        test_pred_cat["tg"]  / N_FOLDS,
+    ]))
+    seed_egc_pred = stacker["egc"].predict(np.column_stack([
+        test_pred_lgb["egc"] / N_FOLDS,
+        test_pred_xgb["egc"] / N_FOLDS,
+        test_pred_cat["egc"] / N_FOLDS,
+    ]))
     all_seed_test_tg.append(seed_tg_pred)
     all_seed_test_egc.append(seed_egc_pred)
     seed_cv_scores.append(cv_r2)

@@ -11,10 +11,11 @@ outputs/
 
 # Run logs
 logs/
-
+.claude/
+.venv/
 # Jupyter
 .ipynb_checkpoints/
-
+catboost_info/
 # OS
 .DS_Store
 Thumbs.db
