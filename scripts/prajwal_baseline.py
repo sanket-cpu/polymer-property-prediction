@@ -1,47 +1,9 @@
 """
-Polymer Property Prediction - Round 2 (v2, boosted)
-Physics-informed + fingerprint descriptor model with weighted ensembling.
-
-Predicts 7 polymer properties (Egc, Egb, Ei, Eea, EPS, Nc, Tg) from polymer SMILES
-using RDKit descriptors + Morgan fingerprints + a "dimer" repeat-unit trick to
-capture chain-level conjugation effects, followed by per-property model
-selection and weighted blending.
-
-No external data, no pretrained weights. Fully self-contained, runs in
-seconds-minutes on CPU.
-
-Key changes vs v1 (aimed at CV R2 0.78 -> ~0.84):
-  1. Full RDKit descriptor set (~200 descriptors) instead of ~35 hand-picked
-     ones, with automatic pruning of constant / near-duplicate columns.
-  2. Morgan fingerprint bits (folded, 256-bit) added as coarse substructure
-     features -- these carry a lot of the signal GBM/RF exploit for
-     electronic properties (Egc, Egb, Ei, Eea).
-  3. "Dimer" trick: the repeat unit is joined head-to-tail with a copy of
-     itself at the * attachment points before descriptor calculation. This
-     lets ring-conjugation / aromaticity / rotatable-bond descriptors see
-     across the repeat-unit boundary, which matters for backbone-driven
-     properties (band gaps, refractive index) far more than a single
-     isolated unit does. Dimer descriptors are added as a *delta* from the
-     monomer values, so they encode "what changes when the chain extends."
-  4. Median imputation of any NaN feature values (full descriptor list can
-     occasionally throw NaN/inf on unusual structures) instead of silently
-     dropping columns.
-  5. Model zoo expanded to include HistGradientBoostingRegressor (fast,
-     usually stronger than the older GradientBoostingRegressor on tabular
-     data) and ElasticNet alongside Ridge/RF/GBM.
-  6. Instead of taking a single "best" model per target, the top-2 models
-     (by CV R2) are blended with softmax-style weights derived from their
-     CV scores -- ensembling reduces variance and typically adds a few
-     points of R2 over picking one winner.
-  7. Feature pruning (variance threshold + correlation threshold) is fit on
-     train only and re-used for test, avoiding leakage while keeping the
-     matrix small enough that model fitting stays fast.
-
-Usage: adjust TRAIN_PATH / TEST_PATH / OUT_PATH below, then run.
+Polymer Property Prediction - Round 3 (v3, Tier-1 PI1M-augmented)
+Refactored & Fixed for Sklearn Pipeline Compatibility
 """
 
-from pathlib import Path
-
+import time
 import numpy as np
 import pandas as pd
 import warnings
@@ -49,12 +11,8 @@ warnings.filterwarnings('ignore')
 
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Descriptors, rdMolDescriptors, rdFingerprintGenerator
+from rdkit import DataStructs
 
-# The dimer-construction step (see _make_dimer_mol) intentionally attempts
-# a bond-surgery + resanitize that fails on some ring topologies; those
-# failures are caught and handled (falls back to zero-delta features), so
-# RDKit's C++ logger spam ("Can't kekulize...") is expected noise, not a
-# sign anything is broken. Silence it so the run log stays readable.
 RDLogger.DisableLog('rdApp.*')
 
 from sklearn.model_selection import KFold, cross_val_score
@@ -67,33 +25,31 @@ from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.base import BaseEstimator, TransformerMixin
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
 # ---- paths ----
-# Resolved relative to this file's location (not the shell's cwd), so the
-# script runs correctly regardless of the directory you invoke it from.
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TRAIN_PATH = PROJECT_ROOT / "data" / "train.csv"
-TEST_PATH = PROJECT_ROOT / "data" / "test.csv"
-OUT_PATH = PROJECT_ROOT / "outputs" / "prajwal_submission.csv"
+TRAIN_PATH = "train.csv"
+TEST_PATH = "test.csv"
+PI1M_PATH = "PI1M.csv"          # column expected: 'smiles' or 'SMILES'
+PI1M_SMILES_COL = "smiles"
+OUT_PATH = "submission.csv"
 
 # ---- feature engineering knobs ----
-FP_BITS = 256          # folded Morgan fingerprint size (keep small = fast)
+FP_BITS = 256
 FP_RADIUS = 2
-VAR_THRESH = 1e-6      # drop near-constant columns
-CORR_THRESH = 0.98     # drop one of any pair of columns correlated above this
-TOP_K_MODELS = 2        # blend the top-K CV models per target, not just 1
+VAR_THRESH = 1e-6
+CORR_THRESH = 0.98
+TOP_K_MODELS = 2
 
-# All RDKit descriptor (name, function) pairs, excluding a couple that are
-# slow/unstable (3D descriptors need embedding, which polymer repeat units
-# with dummy atoms often fail at).
-_SLOW_OR_UNSTABLE = {
-    'Ipc',  # can overflow to inf on larger structures
-}
+# ---- Tier-1 PI1M knobs ----
+PI1M_SAMPLE_SIZE = 20000     # rows sampled from PI1M for stats + density
+DENSITY_TOPK = 7             # avg similarity to top-K nearest PI1M neighbors
+
+_SLOW_OR_UNSTABLE = {'Ipc'}
 _DESC_LIST = [(n, f) for n, f in Descriptors._descList if n not in _SLOW_OR_UNSTABLE]
-
 _MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=FP_RADIUS, fpSize=FP_BITS)
 
 
@@ -101,38 +57,27 @@ _MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=FP_RADIUS, fpSize
 # 1. Featurization
 # ---------------------------------------------------------------------------
 def _parse_mol(smiles):
-    """Parse a polymer repeat-unit SMILES (with * attachment points)."""
     s = smiles.replace('[*]', '*')
     mol = Chem.MolFromSmiles(s)
     if mol is None:
-        # fallback: cap dummy attachment atoms with carbon to keep valence valid
         mol = Chem.MolFromSmiles(s.replace('*', 'C'))
     return mol
 
 
 def _make_dimer_mol(smiles):
-    """
-    Join two copies of the repeat unit at their * attachment points to
-    approximate a short chain segment. Falls back to None if construction
-    fails (rare, e.g. more/less than 2 attachment points).
-    """
     try:
         s = smiles.replace('[*]', '*')
         if s.count('*') != 2:
             return None
-        # Replace the two '*' in unit A with dummy isotopes, unit B likewise,
-        # then bond A's second dummy to B's first dummy via RWMol surgery.
         molA = Chem.MolFromSmiles(s)
         molB = Chem.MolFromSmiles(s)
         if molA is None or molB is None:
             return None
-
         combo = Chem.RWMol(Chem.CombineMols(molA, molB))
         dummy_idx = [a.GetIdx() for a in combo.GetAtoms() if a.GetSymbol() == '*']
         if len(dummy_idx) != 4:
             return None
 
-        # dummy_idx[0], dummy_idx[1] belong to molA; [2], [3] belong to molB
         def neighbor_of(idx):
             atom = combo.GetAtomWithIdx(idx)
             nbrs = atom.GetNeighbors()
@@ -142,24 +87,13 @@ def _make_dimer_mol(smiles):
         b1 = neighbor_of(dummy_idx[2])
         if a2 is None or b1 is None:
             return None
-
         combo.AddBond(a2, b1, Chem.BondType.SINGLE)
-        # remove the 4 dummy atoms (remove highest index first to keep indices valid)
         for idx in sorted(dummy_idx, reverse=True):
             combo.RemoveAtom(idx)
-
         dimer = combo.GetMol()
         try:
-            # Preferred path: full sanitize (correct kekulization/aromaticity).
             Chem.SanitizeMol(dimer)
         except Exception:
-            # Some ring topologies genuinely can't be re-kekulized after the
-            # junction bond is spliced in (rare, structure-dependent -- not
-            # a bug to "fix" by forcing it). Fall back to a partial sanitize
-            # that skips just the kekulize/aromaticity perception steps, so
-            # we still get valid valences and can compute the non-aromaticity
-            # -dependent portion of the descriptor set instead of discarding
-            # the whole dimer.
             dimer.UpdatePropertyCache(strict=False)
             Chem.SanitizeMol(
                 dimer,
@@ -173,7 +107,6 @@ def _make_dimer_mol(smiles):
 
 
 def _safe_descriptors(mol):
-    """Compute the full RDKit descriptor list, replacing failures with NaN."""
     out = {}
     for name, func in _DESC_LIST:
         try:
@@ -195,22 +128,18 @@ def _morgan_bits(mol):
 
 
 def _custom_physics_feats(mol):
-    """Small set of hand-crafted, physically-motivated ratios (cheap, robust)."""
     feats = {}
     heavy = mol.GetNumHeavyAtoms() or 1
     n_bonds = mol.GetNumBonds() or 1
     atoms = [a.GetSymbol() for a in mol.GetAtoms()]
     n_atoms = len(atoms) or 1
-
     for el in ['C', 'N', 'O', 'S', 'F', 'Cl', 'Br', 'Si', 'P']:
         feats[f'n_{el}'] = atoms.count(el)
         feats[f'frac_{el}'] = atoms.count(el) / n_atoms
-
     n_aromatic_atoms = sum(1 for a in mol.GetAtoms() if a.GetIsAromatic())
     n_conjugated_bonds = sum(1 for b in mol.GetBonds() if b.GetIsConjugated())
     n_rot = rdMolDescriptors.CalcNumRotatableBonds(mol)
     n_rings = rdMolDescriptors.CalcNumRings(mol)
-
     feats['AromaticRatio'] = n_aromatic_atoms / n_atoms
     feats['ConjugationRatio'] = n_conjugated_bonds / n_bonds
     feats['RotBondsPerHeavyAtom'] = n_rot / heavy
@@ -223,17 +152,11 @@ def featurize(smiles):
     mol = _parse_mol(smiles)
     if mol is None:
         return None
-
     feats = {}
     try:
         feats.update(_safe_descriptors(mol))
         feats.update(_custom_physics_feats(mol))
         feats.update(_morgan_bits(mol))
-
-        # Dimer-delta features: how key backbone-sensitive descriptors shift
-        # when the chain is extended by one repeat unit. Captures
-        # conjugation/rigidity trends that a single isolated unit misses,
-        # which is especially informative for Egc/Egb/Nc.
         dimer = _make_dimer_mol(smiles)
         if dimer is not None:
             dimer_heavy = dimer.GetNumHeavyAtoms() or 1
@@ -253,38 +176,160 @@ def featurize(smiles):
     return feats
 
 
+def featurize_lightweight(smiles):
+    mol = _parse_mol(smiles)
+    if mol is None:
+        return None
+    try:
+        feats = {}
+        feats.update(_safe_descriptors(mol))
+        feats.update(_custom_physics_feats(mol))
+        return feats
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
-# 2. Feature matrix cleanup (fit on train, applied to test)
+# 2. PI1M loading + sampling + lightweight featurization
 # ---------------------------------------------------------------------------
-def fit_feature_pruner(df):
-    """
-    Returns the list of columns to keep, after dropping near-constant
-    columns and one column from each highly-correlated pair. Fit on train
-    only to avoid leakage.
-    """
-    variances = df.var(numeric_only=True)
+def load_pi1m_sample(path, smiles_col, sample_size, seed=RANDOM_STATE):
+    print(f"Loading PI1M from {path} ...")
+    pi1m = pd.read_csv(path)
+    if smiles_col not in pi1m.columns:
+        candidates = [c for c in pi1m.columns if 'smiles' in c.lower()]
+        if not candidates:
+            raise ValueError(f"Could not find a SMILES column in {path}; columns found: {list(pi1m.columns)}")
+        smiles_col_local = candidates[0]
+    else:
+        smiles_col_local = smiles_col
+    print(f"PI1M full size: {len(pi1m)} rows, using column '{smiles_col_local}'")
+
+    n = min(sample_size, len(pi1m))
+    pi1m_sample = pi1m[[smiles_col_local]].dropna().drop_duplicates()
+    pi1m_sample = pi1m_sample.sample(n=min(n, len(pi1m_sample)), random_state=seed).reset_index(drop=True)
+    pi1m_sample = pi1m_sample.rename(columns={smiles_col_local: 'smiles'})
+    print(f"Sampled {len(pi1m_sample)} PI1M rows for Tier-1 use")
+    return pi1m_sample
+
+
+def featurize_pi1m_lightweight(pi1m_sample):
+    t0 = time.time()
+    feats = pi1m_sample['smiles'].apply(featurize_lightweight)
+    valid = feats.notna()
+    feat_df = pd.DataFrame(list(feats[valid])).reset_index(drop=True)
+    print(f"PI1M lightweight featurization: {valid.sum()}/{len(pi1m_sample)} valid in {time.time() - t0:.1f}s")
+    return feat_df, pi1m_sample.loc[valid, 'smiles'].reset_index(drop=True)
+
+
+def build_pi1m_fp_index(pi1m_smiles):
+    t0 = time.time()
+    fps = []
+    for smi in pi1m_smiles:
+        mol = _parse_mol(smi)
+        if mol is None:
+            continue
+        fps.append(_MORGAN_GEN.GetFingerprint(mol))
+    print(f"Built PI1M fingerprint index: {len(fps)} fps in {time.time() - t0:.1f}s")
+    return fps
+
+
+def density_features(smiles_series, pi1m_fps, topk=DENSITY_TOPK):
+    t0 = time.time()
+    max_sims = np.zeros(len(smiles_series))
+    topk_means = np.zeros(len(smiles_series))
+    for i, smi in enumerate(smiles_series):
+        mol = _parse_mol(smi)
+        if mol is None:
+            max_sims[i] = np.nan
+            topk_means[i] = np.nan
+            continue
+        fp = _MORGAN_GEN.GetFingerprint(mol)
+        sims = np.array(DataStructs.BulkTanimotoSimilarity(fp, pi1m_fps))
+        if len(sims) == 0:
+            max_sims[i] = np.nan
+            topk_means[i] = np.nan
+            continue
+        top = np.sort(sims)[-topk:]
+        max_sims[i] = top[-1]
+        topk_means[i] = top.mean()
+    print(f"Computed density features for {len(smiles_series)} molecules in {time.time() - t0:.1f}s")
+    return pd.DataFrame({
+        'pi1m_max_sim': max_sims,
+        'pi1m_topk_mean_sim': topk_means,
+    })
+
+
+# ---------------------------------------------------------------------------
+# 3. Feature pruning & Prefit Scaler (Fixed)
+# ---------------------------------------------------------------------------
+def fit_feature_pruner_combined(train_feat_df, pi1m_feat_df, feature_cols_common):
+    combined = pd.concat(
+        [train_feat_df[feature_cols_common], pi1m_feat_df[feature_cols_common]],
+        axis=0, ignore_index=True
+    )
+    variances = combined.var(numeric_only=True)
     keep = variances[variances > VAR_THRESH].index.tolist()
 
-    corr = df[keep].corr().abs()
+    corr = combined[keep].corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop = [c for c in upper.columns if any(upper[c] > CORR_THRESH)]
     keep = [c for c in keep if c not in to_drop]
     return keep
 
 
+def fit_global_scaler(train_feat_df, pi1m_feat_df, feature_cols):
+    combined = pd.concat(
+        [train_feat_df[feature_cols], pi1m_feat_df[feature_cols]],
+        axis=0, ignore_index=True
+    )
+    imputer = SimpleImputer(strategy='median')
+    combined_imp = imputer.fit_transform(combined)
+    scaler = StandardScaler()
+    scaler.fit(combined_imp)
+    return imputer, scaler
+
+
+class _FittedStateWrapper:
+    """Helper class to hide fitted estimators from sklearn's clone() wipe."""
+    def __init__(self, imputer, scaler):
+        self.imputer = imputer
+        self.scaler = scaler
+
+
+class PrefitScaler(BaseEstimator, TransformerMixin):
+    """Fixed: Transformer wrapper that registers sklearn attributes and bypasses re-fitting."""
+    def __init__(self, state):
+        self.state = state
+
+    def fit(self, X, y=None):
+        # Register sklearn fitting state check attributes
+        self.n_features_in_ = getattr(
+            self.state.imputer, 
+            "n_features_in_", 
+            X.shape[1] if hasattr(X, "shape") else None
+        )
+        self.is_fitted_ = True
+        return self
+
+    def transform(self, X):
+        X_imp = self.state.imputer.transform(X)
+        return self.state.scaler.transform(X_imp)
+
+
 # ---------------------------------------------------------------------------
-# 3. Model zoo
+# 4. Model zoo
 # ---------------------------------------------------------------------------
-def get_model_zoo():
+def get_model_zoo(prefit_imputer, prefit_scaler):
+    # Wrap the fitted components so clone() deepcopies them instead of resetting them
+    state = _FittedStateWrapper(prefit_imputer, prefit_scaler)
+    
     return {
         'Ridge': Pipeline([
-            ('imp', SimpleImputer(strategy='median')),
-            ('sc', StandardScaler()),
+            ('sc', PrefitScaler(state)),
             ('m', Ridge(alpha=5.0, random_state=RANDOM_STATE)),
         ]),
         'ElasticNet': Pipeline([
-            ('imp', SimpleImputer(strategy='median')),
-            ('sc', StandardScaler()),
+            ('sc', PrefitScaler(state)),
             ('m', ElasticNet(alpha=0.01, l1_ratio=0.3, random_state=RANDOM_STATE, max_iter=5000)),
         ]),
         'RF': Pipeline([
@@ -309,15 +354,14 @@ def get_model_zoo():
 
 
 def softmax_weights(scores):
-    """Convert a list of CV R2 scores into positive blend weights."""
     arr = np.array(scores, dtype=float)
-    arr = arr - arr.max()  # numerical stability
-    w = np.exp(arr * 5.0)  # sharpen so the better model dominates a bit
+    arr = arr - arr.max()
+    w = np.exp(arr * 5.0)
     return w / w.sum()
 
 
 # ---------------------------------------------------------------------------
-# 4. Main pipeline
+# 5. Main pipeline
 # ---------------------------------------------------------------------------
 def main():
     train = pd.read_csv(TRAIN_PATH)
@@ -328,30 +372,58 @@ def main():
     train_feats = train['smiles'].apply(featurize)
     valid_mask = train_feats.notna()
     print(f"Featurized {valid_mask.sum()}/{len(train)} train molecules")
-
     train_feat_df = pd.DataFrame(list(train_feats[valid_mask])).reset_index(drop=True)
     train_valid = train[valid_mask].reset_index(drop=True)
 
-    # --- prune features on train only ---
-    feature_cols = fit_feature_pruner(train_feat_df)
-    print(f"Kept {len(feature_cols)}/{train_feat_df.shape[1]} features after pruning")
+    # --- featurize test ---
+    test_feats = test['smiles'].apply(featurize)
+    test_valid_mask = test_feats.notna()
+    print(f"Featurized {test_valid_mask.sum()}/{len(test)} test molecules")
+
+    # --- PI1M: sample, lightweight-featurize, build fp index ---
+    pi1m_sample = load_pi1m_sample(PI1M_PATH, PI1M_SMILES_COL, PI1M_SAMPLE_SIZE)
+    pi1m_feat_df, pi1m_smiles_valid = featurize_pi1m_lightweight(pi1m_sample)
+    pi1m_fps = build_pi1m_fp_index(pi1m_smiles_valid)
+
+    # --- density features for train/test ---
+    train_density = density_features(train_valid['smiles'], pi1m_fps)
+    test_density = density_features(test['smiles'], pi1m_fps)
+    train_feat_df = pd.concat([train_feat_df, train_density], axis=1)
+
+    # --- prune features ---
+    common_cols = [c for c in pi1m_feat_df.columns if c in train_feat_df.columns]
+    pruned_common = fit_feature_pruner_combined(train_feat_df, pi1m_feat_df, common_cols)
+
+    fp_dimer_density_cols = [c for c in train_feat_df.columns
+                              if c.startswith('fp_') or c.startswith('dimer_delta_')
+                              or c.startswith('pi1m_')]
+    feature_cols = pruned_common + fp_dimer_density_cols
+    print(f"Kept {len(feature_cols)} features after PI1M-informed pruning "
+          f"({len(pruned_common)} descriptor/physics + {len(fp_dimer_density_cols)} fp/dimer/density)")
+
+    # --- global scaler fit on train + PI1M sample ---
+    prefit_imputer, prefit_scaler = fit_global_scaler(train_feat_df, pi1m_feat_df, pruned_common)
 
     full_train = pd.concat(
         [train_valid[['target', 'target_type']], train_feat_df[feature_cols]], axis=1
     )
 
-    # --- per-target-type: CV-evaluate model zoo, blend top-K ---
+    # --- cross-validation & model evaluation ---
     kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    blend_config = {}   # target_type -> list of (model_name, weight)
+    blend_config = {}
     cv_scores_summary = {}
 
     for tt in sorted(full_train['target_type'].unique()):
         sub = full_train[full_train['target_type'] == tt]
-        X = sub[feature_cols].values
         y = sub['target'].values
 
         scores_per_model = {}
-        for name, model in get_model_zoo().items():
+        zoo = get_model_zoo(prefit_imputer, prefit_scaler)
+        for name, model in zoo.items():
+            if name in ('Ridge', 'ElasticNet'):
+                X = sub[pruned_common].values
+            else:
+                X = sub[feature_cols].values
             scores = cross_val_score(model, X, y, cv=kf, scoring='r2', n_jobs=-1)
             scores_per_model[name] = scores.mean()
 
@@ -360,43 +432,42 @@ def main():
         names, scores = zip(*top)
         weights = softmax_weights(scores)
         blend_config[tt] = list(zip(names, weights))
-        cv_scores_summary[tt] = ranked[0][1]  # best single-model CV score for reporting
+        cv_scores_summary[tt] = ranked[0][1]
 
         print(f"{tt:5s} (n={len(y):4d})  " +
               "  ".join(f"{k}={v:.3f}" for k, v in scores_per_model.items()) +
               "  -> BLEND: " + ", ".join(f"{n}({w:.2f})" for n, w in blend_config[tt]))
 
     mean_cv_r2 = np.mean(list(cv_scores_summary.values()))
-    print(f"\nEstimated mean CV R2 across all 7 targets (best single model each): {mean_cv_r2:.4f}")
-    print("(actual blended CV R2 is typically equal to or slightly better than this)\n")
+    print(f"\nEstimated mean CV R2 across all targets: {mean_cv_r2:.4f}\n")
 
-    # --- train final blended models on full data ---
-    final_models = {}   # target_type -> list of (fitted_model, weight)
+    # --- train final ensemble models ---
+    final_models = {}
     target_means = {}
     for tt in sorted(full_train['target_type'].unique()):
         sub = full_train[full_train['target_type'] == tt]
-        X = sub[feature_cols].values
         y = sub['target'].values
         target_means[tt] = y.mean()
 
-        zoo = get_model_zoo()
+        zoo = get_model_zoo(prefit_imputer, prefit_scaler)
         fitted = []
         for name, weight in blend_config[tt]:
             model = zoo[name]
+            X = sub[pruned_common].values if name in ('Ridge', 'ElasticNet') else sub[feature_cols].values
             model.fit(X, y)
-            fitted.append((model, weight))
+            fitted.append((model, weight, name))
         final_models[tt] = fitted
 
-    # --- featurize test ---
-    test_feats = test['smiles'].apply(featurize)
-    test_valid_mask = test_feats.notna()
-    print(f"Featurized {test_valid_mask.sum()}/{len(test)} test molecules")
-
+    # --- test inference ---
     test_feat_df = pd.DataFrame(index=test.index, columns=feature_cols, dtype=float)
     for idx in test.index[test_valid_mask]:
         row = test_feats[idx]
         for k in feature_cols:
+            if k in ('pi1m_max_sim', 'pi1m_topk_mean_sim'):
+                continue
             test_feat_df.loc[idx, k] = row.get(k, np.nan)
+    test_feat_df.loc[test.index, 'pi1m_max_sim'] = test_density['pi1m_max_sim'].values
+    test_feat_df.loc[test.index, 'pi1m_topk_mean_sim'] = test_density['pi1m_topk_mean_sim'].values
 
     predictions = np.zeros(len(test))
     for tt in sorted(full_train['target_type'].unique()):
@@ -407,19 +478,18 @@ def main():
         rows_invalid = mask & (~test_valid_mask.values)
 
         if rows_valid.sum() > 0:
-            X_test = test_feat_df.loc[rows_valid, feature_cols].values.astype(float)
             blend_pred = np.zeros(rows_valid.sum())
-            for model, weight in final_models[tt]:
+            for model, weight, name in final_models[tt]:
+                cols = pruned_common if name in ('Ridge', 'ElasticNet') else feature_cols
+                X_test = test_feat_df.loc[rows_valid, cols].values.astype(float)
                 blend_pred += weight * model.predict(X_test)
             predictions[rows_valid] = blend_pred
 
         if rows_invalid.sum() > 0:
-            # fallback for the rare unparsable SMILES: use training mean for that property
             predictions[rows_invalid] = target_means[tt]
 
     test['target'] = predictions
     submission = test[['id', 'target']].copy()
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     submission.to_csv(OUT_PATH, index=False)
     print(f"Saved {OUT_PATH} with shape {submission.shape}")
 
