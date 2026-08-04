@@ -5,10 +5,12 @@ __pycache__/
 
 # Virtual environment (the uv venv)
 polymer-property-prediction/
-
+.venv/
+.claude/
 # Generated outputs
 outputs/
-
+/submission.csv
+/catboost_info/
 # Jupyter
 .ipynb_checkpoints/
 

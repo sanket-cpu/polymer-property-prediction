@@ -40,6 +40,8 @@ Key changes vs v1 (aimed at CV R2 0.78 -> ~0.84):
 Usage: adjust TRAIN_PATH / TEST_PATH / OUT_PATH below, then run.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import warnings
@@ -69,10 +71,13 @@ from sklearn.impute import SimpleImputer
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
-# ---- paths (edit these to match your environment / Kaggle input folder) ----
-TRAIN_PATH = "train.csv"
-TEST_PATH = "test.csv"
-OUT_PATH = "submission.csv"
+# ---- paths ----
+# Resolved relative to this file's location (not the shell's cwd), so the
+# script runs correctly regardless of the directory you invoke it from.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TRAIN_PATH = PROJECT_ROOT / "data" / "train.csv"
+TEST_PATH = PROJECT_ROOT / "data" / "test.csv"
+OUT_PATH = PROJECT_ROOT / "outputs" / "prajwal_submission.csv"
 
 # ---- feature engineering knobs ----
 FP_BITS = 256          # folded Morgan fingerprint size (keep small = fast)
@@ -414,6 +419,7 @@ def main():
 
     test['target'] = predictions
     submission = test[['id', 'target']].copy()
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     submission.to_csv(OUT_PATH, index=False)
     print(f"Saved {OUT_PATH} with shape {submission.shape}")
 
