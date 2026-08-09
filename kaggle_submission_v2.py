@@ -271,6 +271,33 @@ PL_CONF_FRACTION = 0.5
 PL_SAMPLE_WEIGHT = 0.5
 PL_MIN_ROWS = 5
 PL_BAG_SEEDS = BAG_SEEDS[:len(BAG_SEEDS) // 2]
+# Looser-than-default confidence thresholds tried live, per target, by
+# evaluate_pl_conf_fraction -- only shipped for a target if that target's
+# own paired delta clears its own noise floor. Restricted to
+# PL_CONF_SEARCH_TARGETS because the simulation replays a full
+# pseudo-labeling round inside every fold (see that function's docstring),
+# which is only affordable on the ~230-row targets; eps and nc are also
+# the two the loosening is most plausible for, being the weakest-CV
+# targets with the least real training signal to begin with.
+PL_CONF_CANDIDATES = [0.65, 0.8]
+# ei added (was {'eps', 'nc'}): it has the 2nd-largest CV deficit of any
+# target and already gets the 3D-conformer block (D3D_TARGETS), but was the
+# only top-3-deficit target still on the untuned default PL_CONF_FRACTION.
+# Same proven mechanism (evaluate_pl_conf_fraction), one more target.
+PL_CONF_SEARCH_TARGETS = {'eps', 'ei', 'nc'}
+
+# GNN track CLOSED. The 3-seed multi-task export (gnn_mt_export.log) settled
+# it: pooled OOF R2 lost to the tuned 8-model stack on every one of the 5
+# candidate targets, by real margins, not noise --
+#   eps 0.7529 vs 0.8014 (-0.0485), ei 0.7968 vs 0.8329 (-0.0361),
+#   nc  0.8364 vs 0.8558 (-0.0194), egc 0.9037 vs 0.9201 (-0.0164),
+#   tg  0.8997 vs 0.9111 (-0.0114).
+# An empty set short-circuits the whole GNN path in process_target (the
+# `if tt in GNN_STACK_TARGETS` guard is never true), so a run loads no
+# gnn_oof_*/gnn_test_* files and never invokes evaluate_gnn_stack_column.
+# load_gnn_predictions/evaluate_gnn_stack_column are left defined but unused;
+# re-enable by listing targets here only if that verdict is ever overturned.
+GNN_STACK_TARGETS = set()
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1037,13 @@ def canonical_smiles(smiles):
 
 def load_train_with_groups():
     train = pd.read_csv(TRAIN_PATH)
+    # Stable row identity, captured before any filtering: this is the row's
+    # position in the raw train.csv and it survives both the canon drop
+    # below and compute_raw_features' separate featurize drop. The saved
+    # GNN prediction columns (see load_gnn_predictions) are keyed on it --
+    # gnn_prototype.py and this script filter rows at different points, so
+    # positional alignment between the two frames is not safe.
+    train['orig_row'] = np.arange(len(train))
     train['canon'] = train['smiles'].apply(canonical_smiles)
     n_bad = train['canon'].isna().sum()
     if n_bad:
@@ -1611,8 +1645,18 @@ def apply_fold_ensemble(fold_models, X_ext_df):
     return preds / len(fold_models)
 
 
-def fit_predict_full(model_factory, X_tr_df, y_tr_series, X_te_df, sample_weight=None):
-    """sample_weight (used by pseudo-labeling below) needs a different fit()
+def fit_predict_multi(model_factory, X_tr_df, y_tr_series, X_te_dfs, sample_weight=None):
+    """One fit, several predict targets -- the shared implementation behind
+    fit_predict_full below.
+
+    Exists because evaluate_pl_conf_fraction needs each fold's base models
+    to score the validation fold *and* rate the test rows' confidence, and
+    calling fit_predict_full twice would train all 8 models twice for
+    nothing. The training-fold constant-column mask is computed once and
+    applied to every prediction matrix, exactly as drop_constant_columns
+    does for the single-target case.
+
+    sample_weight (used by pseudo-labeling below) needs a different fit()
     kwarg name depending on whether the model is a bare estimator
     ('sample_weight') or a Pipeline ('m__sample_weight', routing to the
     final step) -- and TransformedTargetRegressor (eps/ei) passes fit_params
@@ -1622,8 +1666,7 @@ def fit_predict_full(model_factory, X_tr_df, y_tr_series, X_te_df, sample_weight
     weighting isn't meaningful for a pure distance-based fit -- so it's
     silently fit unweighted rather than raising)."""
     Xtr = X_tr_df.values.astype(float)
-    Xte = X_te_df.values.astype(float)
-    Xtr, Xte = drop_constant_columns(Xtr, Xte)
+    keep = constant_column_mask(Xtr)
     model = model_factory()
 
     fit_kwargs = {}
@@ -1634,8 +1677,230 @@ def fit_predict_full(model_factory, X_tr_df, y_tr_series, X_te_df, sample_weight
             kwarg = 'm__sample_weight' if hasattr(inner, 'named_steps') else 'sample_weight'
             fit_kwargs[kwarg] = sample_weight
 
-    model.fit(Xtr, y_tr_series.values, **fit_kwargs)
-    return model.predict(Xte)
+    model.fit(Xtr[:, keep], y_tr_series.values, **fit_kwargs)
+    return [model.predict(X.values.astype(float)[:, keep]) for X in X_te_dfs]
+
+
+def fit_predict_full(model_factory, X_tr_df, y_tr_series, X_te_df, sample_weight=None):
+    return fit_predict_multi(
+        model_factory, X_tr_df, y_tr_series, [X_te_df], sample_weight)[0]
+
+
+def _find_gnn_file(name):
+    """Locate a saved GNN prediction file next to the data or next to this
+    script. Returns None if absent -- every GNN code path in this file is
+    opt-in on these files existing, so the pipeline stays fully runnable
+    (and submittable) without them."""
+    candidates = [INPUT_DIR]
+    try:
+        candidates.append(Path(__file__).resolve().parent)
+    except NameError:
+        candidates.append(Path.cwd())
+    for d in candidates:
+        p = d / name
+        if p.exists():
+            return p
+    return None
+
+
+def load_gnn_predictions(tt, train_valid, test):
+    """Load gnn_prototype.py's saved seed-bagged predictions for tt.
+
+    IMPORTANT -- these files are an OFFLINE EVALUATION MECHANISM, not a
+    submission path. Competition rule 6.2.3 requires the entire pipeline to
+    execute inside the notebook with nothing loaded from outside, so
+    uploading these CSVs alongside the kernel would be a rule violation.
+    They exist so the GNN's contribution can be measured here without
+    torch and LightGBM sharing a process (which segfaults on macOS -- see
+    gnn_prototype.py). If the column is ever accepted, shipping it means
+    training chemprop inside the notebook, not shipping these files.
+
+    Returns (oof_series over train_valid's index, test_series over test's
+    index) or None if the files are missing or don't cover tt's rows."""
+    oof_path = _find_gnn_file(f"gnn_oof_{tt}.csv")
+    test_path = _find_gnn_file(f"gnn_test_{tt}.csv")
+    if oof_path is None or test_path is None:
+        return None
+
+    oof_raw = pd.read_csv(oof_path)
+    test_raw = pd.read_csv(test_path)
+
+    row_to_index = pd.Series(train_valid.index.values,
+                             index=train_valid['orig_row'].to_numpy())
+    mapped = oof_raw['orig_row'].map(row_to_index)
+    keep = mapped.notna()
+    oof = pd.Series(np.nan, index=train_valid.index, dtype=float)
+    oof.loc[mapped[keep].astype(int).to_numpy()] = oof_raw.loc[keep, 'gnn_pred'].to_numpy()
+
+    test_series = pd.Series(np.nan, index=test.index, dtype=float)
+    in_range = test_raw['test_row'].isin(test.index)
+    test_series.loc[test_raw.loc[in_range, 'test_row'].to_numpy()] = \
+        test_raw.loc[in_range, 'gnn_pred'].to_numpy()
+
+    own_rows = train_valid.index[train_valid['target_type'] == tt]
+    if oof.loc[own_rows].isna().any():
+        n_missing = int(oof.loc[own_rows].isna().sum())
+        print(f"  {tt:5s}: GNN OOF file covers only "
+              f"{len(own_rows) - n_missing}/{len(own_rows)} rows -- skipping GNN column")
+        return None
+    return oof, test_series
+
+
+def evaluate_gnn_stack_column(tt, oof_df, gnn_oof, y_all, train_valid, t0):
+    """Accept/reject the saved GNN prediction as a 9th column of tt's OOF
+    matrix, against the real tuned 8-model stack -- not the deliberately
+    weak untuned LightGBM proxy used for feature-block decisions elsewhere,
+    which would overstate the gain by comparing against a much lower bar.
+
+    Uses the SAME split structure and paired statistic as
+    paired_delta_verdict: get_xtarget_eval_splits' 3 independent seeds x
+    5 folds (15 folds), which forces 3 seeds even for the large targets --
+    not get_harness_splits, whose large-target repeat gating collapses
+    egc/tg to a single 5-fold seed. That distinction is the whole point of
+    this function's history: an earlier version passed get_harness_splits'
+    `repeats` straight through, so egc/tg's noise floor was the std of only
+    5 paired deltas -- both a thinner estimate and biased low (the
+    sample-std bias factor is ~0.94 at n=5 vs ~0.98 at n=15), which put the
+    egc/tg floors at roughly half of every other paired accept/reject's
+    floor on the same targets and same folds this session, i.e. a
+    systematically too-easy bar. Scoring per seed and concatenating, as
+    below, makes the floor directly comparable to the cross-target/dense/3D
+    verdicts.
+
+    The 8-model oof_df and the GNN column are both fixed per-row held-out
+    predictions; re-splitting them across 3 seeds to CV the meta-learner
+    treats the GNN column identically to the 8 base columns and introduces
+    no leakage -- exactly what get_xtarget_eval_splits is for.
+
+    Returns (accepted, candidate_oof_df)."""
+    sub_index, seed_folds = get_xtarget_eval_splits(train_valid, tt)
+    cand = oof_df.copy()
+    cand['GNN'] = gnn_oof.loc[sub_index].to_numpy()
+    meta = META_LEARNER_CANDIDATES['Ridge']
+
+    a_scores, b_scores = [], []
+    for folds in seed_folds:
+        a_scores.append(score_model_folds(meta, oof_df, y_all, sub_index, [folds]))
+        b_scores.append(score_model_folds(meta, cand, y_all, sub_index, [folds]))
+    a = np.concatenate(a_scores)
+    b = np.concatenate(b_scores)
+    deltas = b - a
+    delta, noise_floor = float(deltas.mean()), float(deltas.std())
+    accepted = delta > noise_floor
+
+    print(f"  {tt:5s}: GNN 9th-column test ({len(a)} folds, 3-seed paired) -- "
+          f"8-model stack={a.mean():.4f}, +GNN={b.mean():.4f}, "
+          f"delta={delta:+.4f} vs noise floor {noise_floor:.4f} "
+          f"({'ACCEPT' if accepted else 'reject'}) [{time.time()-t0:.0f}s]")
+    return accepted, cand
+
+
+def evaluate_pl_conf_fraction(tt, X_tt, y_all, train_valid, X_te_tt,
+                               accepted_tuned_configs, cv_r2, t0):
+    """Live accept/reject search over PL_CONF_FRACTION for one target.
+
+    WHY THIS NEEDS ITS OWN SIMULATION, unlike every other tuned decision in
+    this file: pseudo-labeling reads *test.csv* rows and only ever changes
+    the test-side prediction. It is not on the CV path at all -- no fold
+    score anywhere in this script moves when PL_CONF_FRACTION changes, so
+    score_model/paired_delta_verdict physically cannot rate it. To get a
+    real harness-scored verdict, the whole pseudo-labeling round has to be
+    replayed *inside* each fold: train the base models on the training
+    fold, use them to rate and pseudo-label the real test rows exactly as
+    production does, retrain on the augmented set, and score the held-out
+    fold. That is what this does, on get_harness_splits' folds -- the same
+    splits as everything else.
+
+    Two deliberate simplifications, both applied identically to the default
+    and to every candidate, so the *paired delta* (the thing the verdict
+    turns on) stays meaningful even though the absolute R2 here won't match
+    the production stacked number:
+      - base models are combined by plain mean rather than by the fitted
+        Ridge meta-learner. Using oof_meta[tt] would be more faithful to
+        production, but it was fit on OOF predictions covering these very
+        validation rows, so it would leak their labels into the simulation.
+      - the per-fold base models are fit at a single seed, not bagged over
+        BAG_SEEDS. pred_std here is the disagreement *between the 8 model
+        families*, which is what the gate actually keys on and is
+        dominated by family differences rather than seed noise; bagging
+        would multiply this search's cost by 10 to shave a little off it.
+
+    Returns the fraction to ship for this target."""
+    sub_index, repeats = get_harness_splits(train_valid, tt)
+    names = model_names_for(tt)
+    factories = get_zoo_factories(tt, accepted_tuned_configs)
+    clip_lo, clip_hi = clip_bounds_for(tt, y_all, train_valid)
+    fracs = [PL_CONF_FRACTION] + PL_CONF_CANDIDATES
+    per_frac = {f: [] for f in fracs}
+
+    for folds in repeats:
+        for tr_pos, va_pos in folds:
+            tr_idx, va_idx = sub_index[tr_pos], sub_index[va_pos]
+            X_tr, X_va = X_tt.loc[tr_idx], X_tt.loc[va_idx]
+            y_tr, y_va = y_all.loc[tr_idx], y_all.loc[va_idx].values
+
+            # One unaugmented pass per fold: same fitted models give both
+            # the val-fold reference predictions and the test-row spread
+            # the confidence gate thresholds on.
+            va_cols, te_cols = [], []
+            for n in names:
+                p_va, p_te = fit_predict_multi(factories[n], X_tr, y_tr, [X_va, X_te_tt])
+                va_cols.append(p_va)
+                te_cols.append(p_te)
+            base_te = np.column_stack(te_cols)
+            pred_std = base_te.std(axis=1)
+            first_pass = base_te.mean(axis=1)
+            unaug_score = r2_score(y_va, np.column_stack(va_cols).mean(axis=1))
+            expected_resid = y_tr.std() * np.sqrt(max(1 - cv_r2, 0.01))
+
+            # Distinct candidates often select the identical test rows on a
+            # set this small; score each distinct mask once.
+            seen = {}
+            for f in fracs:
+                conf_mask = pred_std < f * expected_resid
+                key = conf_mask.tobytes()
+                if key in seen:
+                    per_frac[f].append(seen[key])
+                    continue
+                if conf_mask.sum() < PL_MIN_ROWS:
+                    score = unaug_score
+                else:
+                    pseudo_y = np.clip(first_pass[conf_mask], clip_lo, clip_hi)
+                    X_aug = pd.concat([X_tr, X_te_tt.loc[conf_mask]], ignore_index=True)
+                    y_aug = pd.concat([y_tr, pd.Series(pseudo_y)], ignore_index=True)
+                    w_aug = np.concatenate([
+                        np.ones(len(y_tr)),
+                        np.full(int(conf_mask.sum()), PL_SAMPLE_WEIGHT)])
+                    aug_va = np.column_stack([
+                        fit_predict_multi(factories[n], X_aug, y_aug, [X_va], w_aug)[0]
+                        for n in names])
+                    score = r2_score(y_va, aug_va.mean(axis=1))
+                seen[key] = score
+                per_frac[f].append(score)
+
+    default_scores = np.array(per_frac[PL_CONF_FRACTION])
+    best_frac, best_delta = PL_CONF_FRACTION, 0.0
+    print(f"  {tt:5s}: PL_CONF_FRACTION search over {fracs} "
+          f"({len(default_scores)} folds, simulated PL round per fold) "
+          f"[{time.time()-t0:.0f}s]")
+    print(f"    default {PL_CONF_FRACTION:.2f}: sim mean R2={default_scores.mean():.4f}")
+    for f in PL_CONF_CANDIDATES:
+        cand = np.array(per_frac[f])
+        # Same paired test as paired_delta_verdict: per-fold differences on
+        # identical splits, compared against the spread of those
+        # differences, not against the two configs' independent stds.
+        deltas = cand - default_scores
+        delta, noise_floor = float(deltas.mean()), float(deltas.std())
+        cleared = delta > noise_floor
+        print(f"    cand    {f:.2f}: sim mean R2={cand.mean():.4f}  "
+              f"delta={delta:+.4f} vs noise floor {noise_floor:.4f} "
+              f"({'ACCEPT' if cleared else 'reject'})")
+        if cleared and delta > best_delta:
+            best_frac, best_delta = f, delta
+
+    print(f"  {tt:5s}: PL_CONF_FRACTION -> {best_frac:.2f}"
+          f"{' (default kept)' if best_frac == PL_CONF_FRACTION else ' (ACCEPTED)'}")
+    return best_frac
 
 
 def bagged_refit_predict(tt, X_tr, y_tr, X_te, accepted_tuned_configs, seeds, sample_weight=None):
@@ -1763,6 +2028,35 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
     oof_df = pd.DataFrame(oof_cols)[names]
     print(f"  {tt:5s}: OOF generated for all {len(names)} models [{time.time()-t0:.0f}s]")
 
+    # ---- GNN as a 9th stack column (egc/tg only, and only if
+    # gnn_prototype.py --export has been run). Decided live by the same
+    # paired accept/reject as every other optional block here, but against
+    # the real tuned stack rather than a proxy model. ----
+    gnn_test_col = None
+    if tt in GNN_STACK_TARGETS:
+        loaded = load_gnn_predictions(tt, train_valid, test)
+        if loaded is None:
+            print(f"  {tt:5s}: no saved GNN predictions found -- 8-model stack unchanged")
+        else:
+            gnn_oof, gnn_test = loaded
+            accepted, cand_oof = evaluate_gnn_stack_column(
+                tt, oof_df, gnn_oof, y_all, train_valid, t0)
+            if accepted:
+                if track_fold_models:
+                    # The dense pred_<tt> feature evaluates this target's
+                    # meta-learner on *other* targets' rows, which the saved
+                    # GNN column doesn't cover (it spans tt's own rows only).
+                    # Rather than materializing GNN predictions for every
+                    # other target's molecules, the dense feature keeps using
+                    # an 8-model meta-learner -- a deliberately small
+                    # difference, since that feature is an input to other
+                    # targets, not tt's own output.
+                    dense_meta = META_LEARNER_CANDIDATES['Ridge']()
+                    dense_meta.fit(oof_df.values, y_all.loc[sub_index].values)
+                    oof_meta[(tt, 'dense')] = dense_meta
+                oof_df = cand_oof
+                gnn_test_col = gnn_test
+
     # Meta-learner selection (Task 3): tests Ridge(positive=True) against
     # the default Ridge on the OOF matrix via the real harness, same
     # accept/reject-against-noise-floor pattern as every tuned
@@ -1790,8 +2084,22 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
 
     if rows_valid.sum() > 0:
         X_te_tt = test_feat_df.loc[rows_valid, feature_cols_tt]
-        base_test_preds = bagged_refit_predict(
+
+        def _with_gnn(base_matrix):
+            """Append the saved GNN test column when it was accepted into
+            this target's stack, so the matrix width matches the 9-column
+            matrix oof_meta[tt] was fitted on. Unlike the 8 base models the
+            GNN column is not retrained during the pseudo-labeling round
+            below -- it is a fixed saved array, so it contributes the same
+            values to both passes."""
+            if gnn_test_col is None:
+                return base_matrix
+            col = gnn_test_col.reindex(X_te_tt.index).to_numpy()
+            return np.column_stack([base_matrix, col])
+
+        base_only_preds = bagged_refit_predict(
             tt, X_tr_tt, y_tr_tt, X_te_tt, accepted_tuned_configs, BAG_SEEDS)
+        base_test_preds = _with_gnn(base_only_preds)
         first_pass_preds = oof_meta[tt].predict(base_test_preds)
 
         # ---- pseudo-labeling: test.csv is competition-provided, not
@@ -1812,9 +2120,20 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
         # session for exactly that bug: a fake meta-learner "refit" that
         # silently reused the old OOF instead of actually incorporating
         # pseudo-label information).
-        pred_std = base_test_preds.std(axis=1)
+        # Disagreement is measured over the 8 base models only, never the
+        # appended GNN column. PL_CONF_FRACTION's 0.5 was calibrated
+        # against 8-model spread; letting a 9th, deliberately dissimilar
+        # model widen that spread would silently re-tune the gate (fewer
+        # rows passing) as a side effect of accepting the GNN, rather than
+        # as a decision anyone made.
+        pred_std = base_only_preds.std(axis=1)
         expected_resid = y_tr_tt.std() * np.sqrt(max(1 - cv_scores[tt][0], 0.01))
-        conf_mask = pred_std < PL_CONF_FRACTION * expected_resid
+        pl_frac = PL_CONF_FRACTION
+        if tt in PL_CONF_SEARCH_TARGETS:
+            pl_frac = evaluate_pl_conf_fraction(
+                tt, X_tt, y_all, train_valid, X_te_tt,
+                accepted_tuned_configs, cv_scores[tt][0], t0)
+        conf_mask = pred_std < pl_frac * expected_resid
 
         if conf_mask.sum() >= PL_MIN_ROWS:
             clip_lo, clip_hi = clip_bounds_for(tt, y_all, train_valid)
@@ -1827,8 +2146,8 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
                 np.ones(len(y_tr_tt)), np.full(int(conf_mask.sum()), PL_SAMPLE_WEIGHT),
             ])
 
-            base_test_preds_pl = bagged_refit_predict(
-                tt, X_aug, y_aug, X_te_tt, accepted_tuned_configs, PL_BAG_SEEDS, w_aug)
+            base_test_preds_pl = _with_gnn(bagged_refit_predict(
+                tt, X_aug, y_aug, X_te_tt, accepted_tuned_configs, PL_BAG_SEEDS, w_aug))
             print(f"  {tt:5s}: {int(conf_mask.sum())}/{len(conf_mask)} test rows "
                   f"pseudo-labeled, base models retrained [{time.time()-t0:.0f}s]")
             test_predictions[rows_valid] = oof_meta[tt].predict(base_test_preds_pl)
@@ -1885,7 +2204,13 @@ def build_dense_predictions(tt_source, X_tr_source, y_tr_source, fold_models_by_
 
     Returns (train_series, test_series), each named f'pred_{tt_source}'
     and indexed over other_target_types' own rows only."""
-    meta_final = oof_meta[tt_source]
+    # (tt_source, 'dense') is present only when tt_source accepted a GNN
+    # column into its own stack; it is that target's meta-learner refit on
+    # the 8 base models alone, because the GNN column doesn't span the
+    # other targets' rows this feature is built for. Falls back to the
+    # target's own meta-learner in every other case, which is what this
+    # always used before.
+    meta_final = oof_meta.get((tt_source, 'dense'), oof_meta[tt_source])
     X_source_full = X_by_target[tt_source]
     names = model_names_for(tt_source)
 
@@ -1911,6 +2236,48 @@ def build_dense_predictions(tt_source, X_tr_source, y_tr_source, fold_models_by_
     print(f"  pred_{tt_source}: dense feature built for {len(other_train_index)} train rows, "
           f"{len(other_test_index)} test rows [{time.time()-t0:.0f}s]")
     return train_series, test_series
+
+
+def apply_dense_sources(source_fits, consumers, X_by_target, feature_cols_by_target,
+                        test_feat_df_by_target, oof_meta, y_all, train_valid, test,
+                        accepted_tuned_configs, t0, label):
+    """Build a dense pred_<source> column from each already-trained source
+    target and offer them, together, as candidate features to each consumer
+    target -- accepting per consumer via the same paired_delta_verdict gate
+    the pred_egc/pred_tg and pred_nc blocks use. Mutates X_by_target /
+    feature_cols_by_target / test_feat_df_by_target in place for the
+    consumers that clear their own noise floor. Returns {consumer: bool}.
+
+    Factored out so a second group of sources (egb/eea -> nc/ei/eps) can
+    reuse the identical build+prune+gate+augment logic as the original
+    egc/tg block, rather than duplicating it a third time."""
+    dense_train_cols, dense_test_cols = {}, {}
+    for tt_source, (X_tr_s, y_tr_s, fold_models) in source_fits.items():
+        tr_series, te_series = build_dense_predictions(
+            tt_source, X_tr_s, y_tr_s, fold_models, oof_meta,
+            X_by_target, test_feat_df_by_target, feature_cols_by_target,
+            accepted_tuned_configs, train_valid, test, set(consumers), t0)
+        dense_train_cols[tr_series.name] = tr_series
+        dense_test_cols[te_series.name] = te_series
+
+    verdicts = {}
+    for tt in consumers:
+        own_tr = train_valid.index[train_valid['target_type'] == tt]
+        own_te = test.index[test['target_type'] == tt]
+        new_tr = pd.DataFrame({n: s.loc[own_tr] for n, s in dense_train_cols.items()})
+        cand_raw = pd.concat([X_by_target[tt], new_tr], axis=1)
+        cand_cols = fit_feature_pruner(cand_raw)
+        cand_X = cand_raw[cand_cols]
+        accepted, _, _, _, _ = paired_delta_verdict(
+            tt, X_by_target[tt], cand_X, y_all, train_valid, t0, label=label)
+        verdicts[tt] = accepted
+        if accepted:
+            X_by_target[tt] = cand_X
+            feature_cols_by_target[tt] = cand_cols
+            new_te = pd.DataFrame({n: s.loc[own_te] for n, s in dense_test_cols.items()})
+            test_feat_df_by_target[tt] = pd.concat(
+                [test_feat_df_by_target[tt], new_te.reindex(test.index)], axis=1)
+    return verdicts
 
 
 # ---------------------------------------------------------------------------
@@ -2160,6 +2527,40 @@ def main():
         print(f"    {tt:5s}: {len(feature_cols_by_target[tt])} features "
               f"({'WITH' if pred_feat_verdicts[tt] else 'WITHOUT'} dense pred_egc/pred_tg)")
 
+    # ---- Round 2b: egb/eea as dense sources for the 3 weakest targets
+    # (nc/ei/eps). egb (~0.94 CV) and eea (~0.89) are both well-predicted,
+    # and the physics ties the weak targets to them directly: ionization
+    # energy ei ~= band gap egb - electron affinity eea, and eps/nc are
+    # coupled to the same electronic polarizability. So egb/eea's *model
+    # predictions* are candidate signal for ei/eps/nc that the sparse
+    # xtarget_ lookups (exact-SMILES-match only) can't supply densely.
+    # egb/eea are trained here FIRST (track_fold_models=True) -- their own
+    # feature sets were already finalized by the pred_egc/tg round above,
+    # and they consume nothing new -- so their fold-ensembles are available
+    # to source dense columns for the 3 consumers before those are trained.
+    # Same build + paired-delta gate as every other dense block; ships per
+    # consumer only where it clears that target's own noise floor. ----
+    print("\n" + "=" * 100)
+    print("Dense pred_egb/pred_eea cross-target features for nc/ei/eps")
+    print("=" * 100)
+
+    dense_source_names = [t for t in ('egb', 'eea') if t in small_target_set]
+    egb_eea_fits = {}
+    for tt in dense_source_names:
+        egb_eea_fits[tt] = process_target(
+            tt, X_by_target, feature_cols_by_target, y_all, train_valid, test,
+            test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
+            oof_meta, cv_scores, test_predictions, t0,
+            track_fold_models=True)
+
+    egb_eea_consumers = [t for t in ('nc', 'ei', 'eps') if t in small_target_set]
+    egb_eea_verdicts = apply_dense_sources(
+        egb_eea_fits, egb_eea_consumers, X_by_target, feature_cols_by_target,
+        test_feat_df_by_target, oof_meta, y_all, train_valid, test,
+        accepted_tuned_configs, t0, label='pred_egb/eea')
+    shipped_ee = [tt for tt in egb_eea_consumers if egb_eea_verdicts[tt]]
+    print(f"\n  Dense pred_egb/pred_eea features SHIP for: {shipped_ee if shipped_ee else '(none)'}")
+
     # ---- Phase 2: OOF stacking + test prediction, small targets. nc
     # first (track_fold_models=True, same as LARGE_TARGETS above) so its
     # own fold-ensemble + full-refit models are available to build a
@@ -2206,7 +2607,11 @@ def main():
     print("OOF stacking + test prediction -- remaining small targets")
     print("=" * 100)
 
-    for tt in [t for t in small_targets_ordered if t != 'nc']:
+    # nc processed above (Phase 2), egb/eea processed in Round 2b as dense
+    # sources -- so only ei/eps remain, now carrying whichever dense
+    # pred_egb/pred_eea (+ pred_nc for eps) columns cleared their gates.
+    already_processed = {'nc', *dense_source_names}
+    for tt in [t for t in small_targets_ordered if t not in already_processed]:
         process_target(
             tt, X_by_target, feature_cols_by_target, y_all, train_valid, test,
             test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
