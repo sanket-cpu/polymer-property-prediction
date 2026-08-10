@@ -1,3 +1,232 @@
+"""
+ANRF AISEHack 2.0 -- Polymer Property Prediction. Single self-contained
+script for a Kaggle Script/Notebook kernel: builds on the pipeline that
+scored 0.849 on the public leaderboard, in one file with no imports from
+this repo's scripts/ directory (Kaggle's kernel environment doesn't have
+those files -- everything importable only from this repo has been inlined
+below).
+
+What's IN, and why:
+  - RDKit descriptors + physics ratios + dimer-delta + 256-bit Morgan
+    fingerprints (prajwal's original featurize()), + 167-bit MACCS keys,
+    + Gasteiger partial-charge summary stats, + ~85 Fragments SMARTS-based
+    functional-group counts, + 6 attachment-point features describing the
+    backbone between the two `*` atoms specifically (path length, backbone
+    vs. side-chain atom fraction, same-ring / aromaticity / sp3 at the
+    junction -- confirmed on the real leaderboard: 0.849->0.858 after
+    adding these), + 3 junction-bond features (conjugated / aromatic /
+    in-ring status of the specific bond formed when two repeat units chain
+    together in _make_dimer_mol -- a more direct read on whether
+    conjugation actually carries from one repeat unit into the next than
+    the whole-dimer-average dimer_delta_* features give), + 3 conjugation-
+    extent features (size of the largest contiguous conjugated system in
+    the molecule, via union-find over conjugated bonds -- distinguishes one
+    big linked conjugated system from several small disconnected ones,
+    which whole-molecule averages like AromaticRatio/ConjugationRatio
+    can't; motivated by scripts/diagnose_weak_targets.py finding OOF error
+    on eps/nc specifically -- both polarizability-driven properties --
+    correlates with ring/conjugation complexity, unlike the other 3 small
+    targets), + full monomer->dimer descriptor deltas (~216 columns, CLAUDE.md
+    task list Task 4 -- the dimer is already built for every molecule for
+    the 3 hand-picked dimer_delta_* ratios above; running the complete
+    _safe_descriptors() set on it too and taking deltas across all of them
+    captures how every RDKit-computed property shifts when the chain
+    extends, not just aromaticity/conjugation/rotatable-bonds specifically).
+    All computed fresh from train.csv/test.csv, no external data.
+  - Cross-target features (v2, re-opening CLAUDE.md's Step 12 -- previously
+    diagnostic-only, see "What's OUT" note below in earlier versions). A
+    canonical-SMILES audit found ~98% of the eea/ei/eps/nc/egb test
+    molecules already exist elsewhere in train.csv under a *different*
+    target_type, with a median of 2-3 other properties already known for
+    that same molecule -- signal the earlier diagnostic-only version never
+    actually fed into predictions. build_cross_target_lookup() builds a
+    wide canon_smiles -> {eea, egb, egc, ei, eps, nc, tg} table from
+    train_valid (mean if a canon SMILES has duplicate rows under the same
+    target_type), and cross_target_feats() joins it into both
+    build_feature_matrix() (train) and the test-featurization block in
+    main() as xtarget_<prop> numeric columns + known_<prop> boolean flags,
+    computed BEFORE fit_feature_pruner so they go through the same
+    variance/correlation pruning as every other feature. A row's own
+    target_type column is always blanked (NaN/known=0) before the join --
+    that value is the label being predicted, and letting it in would be
+    direct leakage, not signal. Whether this block actually ships is
+    decided live, every run, by evaluate_cross_target_features(): a single
+    representative untuned model (LightGBM, same convention
+    scripts/ablation_study.py already established for feature-block-level
+    decisions, as opposed to model/hyperparameter-level ones) scored with
+    vs. without the block on the real harness (get_harness_splits, not the
+    cheap search split) -- only kept if it clears the noise floor (larger
+    of the two configs' fold-to-fold std), identical accept/reject pattern
+    to every other tuned decision in this file.
+  - 3D-conformer descriptors (D3D_TARGETS only -- eps/ei/nc, see
+    conformer_3d_feats): dipole moment magnitude (MMFF partial charges
+    weighted by 3D position) + RDKit's Descriptors3D shape descriptors
+    (radius of gyration, asphericity, eccentricity, spherocity, PMI
+    ratios), off an ETKDGv3-embedded + MMFF-optimized conformer of the
+    *dimer* (reuses _make_dimer_mol exactly as built for the dimer-delta
+    features above, rather than re-deriving a separate `*`-capping
+    scheme -- a raw wildcard atom has no sane geometry to embed, but
+    _make_dimer_mol already resolves both attachment points). Real
+    per-molecule wall-clock cost (embedding + force-field optimization),
+    so computed only for D3D_TARGETS' own rows -- not shared across all 7
+    targets the way every feature block above is -- and gated to eps/ei/nc
+    specifically: exactly the polarizability-/charge-distribution-driven
+    properties (dielectric constant, ionization energy, refractive index)
+    3D shape and dipole moment are physically expected to matter for.
+    Embedding failures (unusual topologies, same edge cases
+    _make_dimer_mol already tolerates for the 2D dimer-delta features)
+    fall back to NaN rather than crashing the run. Tested via the same
+    paired-delta accept/reject pattern as the cross-target block above,
+    per target, before it's allowed to feed the tuning phase below.
+
+    v3: MULTI-CONFORMER. A single ETKDG embed of a flexible dimer backbone
+    is a noisy sample of a whole conformational ensemble -- the "true"
+    dipole/shape isn't one geometry, it's a distribution, and one embed
+    picks an arbitrary point on it. conformer_3d_feats now embeds
+    N_CONFORMERS independently-seeded conformers per molecule (still off
+    the same _make_dimer_mol dimer), MMFF-optimizes each, discards any
+    that failed to converge, and reports both the per-descriptor MEAN
+    (variance-reduced replacement for the old single value) and STD
+    (new signal: how conformationally flexible the molecule's shape/
+    dipole actually are -- a floppy backbone vs. a rigid one) across
+    surviving conformers. Same D3D_TARGETS gating, same paired-delta
+    accept/reject test, same NaN-on-total-failure contract -- only the
+    internals of conformer_3d_feats and _D3D_DEFAULTS changed. Cost scales
+    ~linearly with N_CONFORMERS; see that knob's comment for the runtime
+    tradeoff.
+  - Second fingerprint block (v4, see extra_fp_feats): topological-torsion
+    + atom-pair fingerprints (FP_BITS each), computed for every row of
+    every target_type -- shared feature, same as Morgan/MACCS, not gated
+    to a target subset the way the 3D-conformer block is. Genuinely
+    different structural signal from Morgan (circular/local) and MACCS
+    (fixed SMARTS keys): torsion fingerprints capture 4-atom path
+    environments, atom-pair fingerprints capture pairwise topological
+    distance + atom type. Virtually free to compute; correlation pruning
+    (fit_feature_pruner, already run on every feature block) is relied on
+    to drop bits that end up redundant with Morgan/MACCS rather than a
+    separate accept/reject test -- unlike the cross-target/3D-conformer/
+    dense-prediction blocks, this one isn't gated behind
+    paired_delta_verdict, since it's cheap enough that shipping it
+    unconditionally and letting the pruner + tuned models sort out which
+    bits matter costs less than a dedicated live test would.
+  - log/exp target transform for eps, ei (the two most right-skewed,
+    weakest-CV targets -- see TARGET_TRANSFORMS below).
+  - 8-model zoo (Ridge, KNN, RF, ExtraTrees, GBM, XGBoost, CatBoost,
+    LightGBM) per target_type, combined via out-of-fold stacking with a
+    Ridge meta-learner. KNN and ExtraTrees for genuine instance-based/
+    local-structure signal and stacking diversity. A general SVR/
+    KernelRidge was considered and dropped: their O(n^2)-O(n^3) training
+    cost is a real risk on tg (4,143 rows) inside a once-and-done timed
+    run. A 9th model, KernelRidge with a Tanimoto/Jaccard kernel on raw
+    Morgan fingerprint bits, was tried narrowly for eps/ei/nc and reverted
+    -- net-negative on the final stack (0.8763 without it vs. 0.8755 with
+    it, even after live-tuning its alpha), despite the a priori case for
+    instance-based fingerprint similarity being a genuinely different
+    signal from the other 8 models' descriptor-space view. ElasticNet
+    and HGB (originally in a 10-model zoo) were dropped after
+    scripts/ablation_study.py (Task 2) found ElasticNet correlates with
+    Ridge at 0.98-1.00 and HGB correlates with LightGBM at exactly 1.00 on
+    every single target -- true near-duplicates, not just similar models --
+    with consistently negligible-to-negative individual contribution to
+    the stack. Fewer near-duplicate columns feeding the meta-learner
+    directly reduces multicollinearity-driven coefficient instability, so
+    this targets leaderboard *variance*, not just mean score.
+  - Final refit-predict stage is bagged over BAG_SEEDS (3->5->10 seeds --
+    this benefit is invisible in local CV since CV only ever sees OOF
+    predictions, never the bagged refit, but the 0.849->0.858 leaderboard
+    jump landed well above what the CV-visible feature gains alone
+    predicted, and bagging's variance reduction is the most plausible
+    explanation for the rest) -- each tree/boosting model is refit with a
+    different random_state and the raw predictions averaged before the
+    meta-learner is applied, standard variance reduction. Only this (cheap)
+    final stage is bagged, not OOF generation or meta-learner fitting,
+    which stay at one canonical seed.
+  - Phase 5 output-safety clipping (train min/max + 10% margin, plus hard
+    physical floors on band gap / refractive index / dielectric constant).
+  - Pseudo-labeling on test.csv's own rows, per target_type. test.csv is
+    competition-provided, not external data (Section 6.2.1 only bans
+    outside datasets) -- this is standard semi-supervised learning on the
+    competition's own files, entirely within the single run. A test row's
+    prediction is trusted as a pseudo-label only if the 8 base models
+    (already bagged) agree with each other by less than half of that
+    target's CV-estimated typical residual size; confident rows get
+    safety-clipped (clip_bounds_for) and added to the base models' training
+    data at reduced sample weight for a second, lighter-bagged refit. The
+    meta-learner (oof_meta[tt]) is NOT refit on anything here -- it stays
+    exactly as fit on the real labeled OOF, applied unchanged to the
+    retrained base models' new outputs; see main() for why that's a
+    deliberate choice, not an oversight. Targets the small targets'
+    real bottleneck directly: too few rows to pin down a stable estimate,
+    which no amount of feature engineering or tuning fixes.
+
+Tried and reverted: a target-aware SelectKBest cap (tighter feature limit for
+the 5 small targets, applied to all 10 models instead of just the 3 that
+already had a fixed k=100) was implemented and smoke-tested, but made every
+single target worse -- including tg/egc, whose cap should have been a no-op.
+Root cause: 7 of the 10 models (RF/ExtraTrees/GBM/HGB/XGB/CatBoost/LightGBM)
+previously had no feature cap at all, and evidently used signal spread across
+more columns than a univariate-correlation filter (f_regression) preserves --
+the filter's inherent blind spot to nonlinear/interaction-only signal ended up
+mattering more than the overfitting risk it was meant to fix. Reverted
+rather than iterated on, since the regression was unambiguous across all 7
+targets on the first test.
+
+Rules compliance note on hyperparameter tuning: an earlier version of this
+script hardcoded the 2 CatBoost configs (egc, tg) that a local Optuna search
+found to beat their defaults. That's a violation of "all stages -- including
+model definition/initialization and training -- must execute entirely
+within the notebook during a single run, manual intervention at any stage
+not permitted": those exact hyperparameter values are the *output* of a
+data-dependent search run outside the graded execution, so injecting them
+as constants is manual intervention at the training stage, even though the
+models themselves still fit fresh on train.csv. Fixed by moving the Optuna
+search itself into this script (see TUNE_BOOSTING below) -- the winning
+configs are now discovered live, every run, inside the single execution.
+Ordinary fixed hyperparameters elsewhere in this file (n_estimators=300,
+SELECT_K=100, VAR_THRESH, the clipping margin, etc.) are NOT the same kind
+of issue -- they're engineering defaults chosen by judgment, never fit or
+searched against this dataset, so there's nothing external being replayed.
+
+What's OUT versus the local dev pipeline, and why:
+  1. No Mol2Vec / PI1M-derived features -- and this one is NOT a judgment
+     call, it's a hard rules requirement. Competition Rules Section 6.2.1
+     ("No External Data"): "Use of any external, private, or previously
+     prepared datasets (public or private)... [is] strictly prohibited...
+     Any violation will result in immediate disqualification, regardless
+     of leaderboard position." PI1M.csv is exactly that -- a previously
+     prepared public dataset -- and the rule carves out no exception for
+     "unlabeled" or "structure-only" use. This also rules out any future
+     PI1M-based pseudo-labeling idea for this script, not just Mol2Vec.
+     (Separately: a local ablation found Mol2Vec helps egb/ei but hurts
+     eps/nc, and even setting the rule aside, that result was never
+     validated stacked on top of the current feature set -- so it wasn't
+     a strong candidate anyway.)
+  (Step 12 cross-target features are back IN as of v2 -- see above. The
+  earlier diagnostic-only pass never fed its findings into predictions,
+  which didn't match a fresh canonical-SMILES audit's ~98%-overlap result,
+  so it was rebuilt as a real, live-tested input feature.)
+
+Estimated runtime: aiming to stay under ~2.5 hours on CPU, still dominated
+by the live Optuna search. N_OPTUNA_TRIALS is 35 -- wide enough coverage
+that the original 15-trial search found only 1/21 combos worth accepting.
+N_OPTUNA_TRIALS and BAG_SEEDS are the two knobs to shrink further if a run
+is running long. (N_OPTUNA_TRIALS was briefly parked at 2 for smoke-testing
+control flow during development -- reverted to 35 for every real run.)
+v3 note: N_CONFORMERS=8 multiplies the 3D-conformer block's per-molecule
+cost ~8x over the old single-embed version -- on ~1,000 D3D_TARGETS rows
+this is the next-biggest lever after N_OPTUNA_TRIALS/BAG_SEEDS if a run is
+running long. Drop N_CONFORMERS to 5 (or 3) first before touching
+N_OPTUNA_TRIALS -- it's a narrower, more isolated cut that doesn't reopen
+the tuning-search runtime question.
+
+Input path handling: looks for train.csv anywhere under /kaggle/input/ if
+that directory exists (Kaggle mounts competition data there, under a
+folder name that matches the competition slug, which this script doesn't
+hardcode); otherwise falls back to ./data/ for local testing. Output is
+written to ./submission.csv, which resolves to /kaggle/working/submission.csv
+under Kaggle's default working directory -- exactly where a Code
+Competition looks for it.
+"""
 
 import inspect
 import time
@@ -42,27 +271,66 @@ import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 RANDOM_STATE = 42
-N_JOBS = -1
-# Trimmed from 50 -> 35 to create time budget for the Tier-1 additions below
-# (Fragments features, 2 more zoo models, seed-bagged final refit) while
-# keeping the 2.5hr ceiling -- still far wider coverage than the original
-# 15-trial search that found only 1/21 combos worth accepting.
-N_OPTUNA_TRIALS = 35
+# -1 (all cores) actively hurts on core-starved runtimes: Colab's GPU tier
+# gives only 2 vCPUs, and every model in the zoo requesting n_jobs=-1
+# simultaneously (RF/ExtraTrees/KNN/XGB/CatBoost/LightGBM, several fit in
+# parallel via GroupKFold's fold loop) causes thread oversubscription --
+# more scheduling overhead than parallel speedup, and was a plausible
+# contributor to the run that didn't finish. Capped to the actual core
+# count (via os.cpu_count(), falling back to 4 if that's unavailable)
+# rather than hardcoding a number, so this adapts to whatever runtime
+# actually launches this script without needing a manual edit per
+# environment.
+import os
+N_JOBS = max(1, (os.cpu_count() or 4) - 1)
+
+# ---------------------------------------------------------------------------
+# GPU support (XGBoost + CatBoost only). Auto-detected, not hardcoded --
+# runs correctly whether or not a GPU is actually present, so this script
+# stays submittable in either environment without a manual edit.
+#
+# LightGBM deliberately excluded: its GPU path needs a GPU-built wheel
+# (pip's default `lightgbm` package is CPU-only), which isn't reliably
+# present in a stock Colab image -- silently falling back to CPU there
+# would be fine, but *failing* on an environment where a CPU-only wheel
+# claims GPU support raises the crash risk this refactor is trying to
+# lower, not the opposite. XGBoost/CatBoost's GPU paths are both bundled
+# in their standard pip wheels, so detection here is a real, low-risk win.
+#
+# RF/ExtraTrees/GBM/Ridge/KNN (sklearn) and RDKit featurization have no
+# GPU implementation at all -- this only speeds up the 3 boosting models'
+# OOF/tuning/bagged-refit fits, not the rest of the pipeline. Real benefit
+# is concentrated in tune_all_boosting_models, which was the single
+# largest cost in the run that didn't finish.
+def _detect_gpu():
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+GPU_AVAILABLE = _detect_gpu()
+print(f"GPU detected: {GPU_AVAILABLE}"
+      f"{' -- XGBoost/CatBoost will train on GPU' if GPU_AVAILABLE else ' -- CPU only'}")
+# Trimmed 50 -> 35 -> 18 (Colab GPU-tier crash on the v4 run: the 512-col
+# extra-fingerprint block plus 35-trial search on 2 vCPUs didn't finish).
+# 18 trials still gives real TPE coverage; the accept/reject-vs-noise-floor
+# gate means an unlucky smaller search just keeps more defaults, not a
+# silent quality loss -- it only ever costs upside, never correctness.
+# Raise back toward 35 once verified stable on the actual runtime in use.
+N_OPTUNA_TRIALS = 18
 # Seeds for bagging the *final* refit-predict stage only (not OOF/meta-learner
 # fitting, which always use the single canonical seed every score in this
 # script is measured against). Averages away RF/ExtraTrees/GBM/XGB/CatBoost/
 # LightGBM's own bootstrap/split-order randomness -- standard variance
 # reduction, and cheap since it only multiplies the fast final-refit stage,
-# not the expensive tuning stage. This benefit is invisible in local CV (CV
-# is computed from OOF folds, never the bagged refit) -- the 0.849->0.858
-# leaderboard jump after adding the attachment-point features was bigger
-# than the local CV delta predicted, most plausibly because bagging's
-# variance reduction was doing real work on the actual test set the whole
-# time without ever showing up in any number we could see locally. Bumped
-# 3->5->10 seeds on that basis: this is the one lever directly targeting
-# leaderboard *variance* rather than mean score, the cost is cheap (only
-# multiplies the fast final-refit stage), and we have runtime headroom.
-BAG_SEEDS = list(range(10))
+# not the expensive tuning stage. Trimmed 10 -> 5 alongside N_OPTUNA_TRIALS
+# for the same reason -- still meaningfully bags, at half the final-refit
+# cost. Raise back to 10 once runtime headroom is confirmed.
+BAG_SEEDS = list(range(5))
 
 # Pseudo-labeling config. PL_CONF_FRACTION: a test row's pseudo-label is
 # only trusted if the 8 base models (already bagged across BAG_SEEDS)
@@ -127,8 +395,40 @@ def _find_input_dir():
 INPUT_DIR = _find_input_dir()
 TRAIN_PATH = INPUT_DIR / "train.csv"
 TEST_PATH = INPUT_DIR / "test.csv"
-SAMPLE_SUB_PATH = INPUT_DIR / "sample_submission_pp.csv"
+SAMPLE_SUB_PATH = INPUT_DIR / "sample_submission.csv"
 OUT_PATH = Path("submission.csv")
+CKPT_DIR = Path("checkpoints")
+CKPT_DIR.mkdir(exist_ok=True)
+
+
+def _ckpt_path(name):
+    return CKPT_DIR / f"{name}.pkl"
+
+
+def save_ckpt(name, obj):
+    """Pickle an intermediate result to CKPT_DIR. Cheap insurance against
+    exactly the failure mode that prompted this: a multi-hour run (RDKit
+    featurization + live Optuna search + OOF stacking) with zero
+    intermediate saves loses everything on any crash -- OOM, Colab
+    disconnect, runtime restart -- however far it got. Called after the
+    two most expensive, purely-deterministic-given-inputs stages
+    (featurization, tuning) so a rerun can skip straight past them via
+    load_ckpt instead of recomputing from scratch."""
+    import pickle
+    with open(_ckpt_path(name), 'wb') as f:
+        pickle.dump(obj, f)
+
+
+def load_ckpt(name):
+    """Returns the pickled object, or None if no checkpoint exists yet --
+    callers treat None as 'compute it fresh', so this is safe to call
+    unconditionally at the top of any stage worth checkpointing."""
+    import pickle
+    p = _ckpt_path(name)
+    if not p.exists():
+        return None
+    with open(p, 'rb') as f:
+        return pickle.load(f)
 
 # ---------------------------------------------------------------------------
 # Featurization knobs
@@ -142,6 +442,22 @@ SELECT_K = 100
 _SLOW_OR_UNSTABLE = {'Ipc'}  # can overflow to inf on larger structures
 _DESC_LIST = [(n, f) for n, f in Descriptors._descList if n not in _SLOW_OR_UNSTABLE]
 _MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=FP_RADIUS, fpSize=FP_BITS)
+# Second fingerprint block (v4): topological-torsion + atom-pair. Morgan
+# (circular, local atom environments) and MACCS (fixed SMARTS keys) don't
+# encode longer-range through-bond topology the way these two do -- a
+# torsion fingerprint captures 4-atom paths, atom-pairs capture pairwise
+# topological distance + atom type, both plausible for backbone-length-
+# driven properties (Tg, Egc) that the attachment-point features above
+# approximate more coarsely. Deliberately narrower than Morgan's FP_BITS
+# (128 vs. 256): these two blocks together used to add 512 raw columns,
+# which measurably slowed every fit_feature_pruner call (correlation
+# matrix cost scales with column count) and contributed to OOM crashes on
+# memory-constrained runtimes. 128 bits each still gives real coverage for
+# a ~230-4000 row molecule set -- correlation pruning still does the final
+# cut of whichever bits end up redundant with Morgan/MACCS.
+EXTRA_FP_BITS = 128
+_TT_GEN = rdFingerprintGenerator.GetTopologicalTorsionGenerator(fpSize=EXTRA_FP_BITS)
+_AP_GEN = rdFingerprintGenerator.GetAtomPairGenerator(fpSize=EXTRA_FP_BITS)
 # RDKit's ~85 SMARTS-based functional-group counters (amines, esters,
 # aromatic rings, halides, etc.) -- genuinely different signal from the
 # topology/counting descriptors and fingerprints above, and virtually free
@@ -322,6 +638,24 @@ def _morgan_bits(mol):
     for bit in fp.GetOnBits():
         arr[bit] = 1
     return {f'fp_{i}': int(arr[i]) for i in range(FP_BITS)}
+
+
+def extra_fp_feats(mol):
+    """Topological-torsion + atom-pair fingerprint bits (v4, EXTRA_FP_BITS
+    wide -- see that knob's comment). Genuinely different structural signal
+    from Morgan (circular, local) and MACCS (fixed SMARTS keys): a
+    topological-torsion fingerprint captures 4-atom path environments, an
+    atom-pair fingerprint captures pairwise topological distance + atom
+    type -- both plausible for backbone-length/rigidity-driven properties
+    (Tg, Egc) in a way the fixed-radius Morgan bits and attachment-point
+    path features approximate only coarsely. Dense zero-filled, same
+    pattern as _morgan_bits, so every row gets a fixed-width column set
+    regardless of which bits happen to fire on that particular molecule."""
+    tt_on = set(_TT_GEN.GetFingerprint(mol).GetOnBits())
+    ap_on = set(_AP_GEN.GetFingerprint(mol).GetOnBits())
+    out = {f'tt_{i}': int(i in tt_on) for i in range(EXTRA_FP_BITS)}
+    out.update({f'ap_{i}': int(i in ap_on) for i in range(EXTRA_FP_BITS)})
+    return out
 
 
 def _custom_physics_feats(mol):
@@ -664,14 +998,24 @@ def conformer_3d_feats(smiles, n_confs=N_CONFORMERS):
 
 def fit_feature_pruner(df):
     """Columns to keep after dropping near-constant columns and one column
-    from each highly-correlated pair. Fit on train only to avoid leakage."""
+    from each highly-correlated pair. Fit on train only to avoid leakage.
+
+    Cast to float32 before the correlation pass -- this function is called
+    repeatedly (base features, xtarget candidate, d3d candidate, each dense
+    pred_ candidate, per target) on frames that are now ~1500 columns wide
+    after the v4 fingerprint block, and pandas' default float64 .corr()
+    roughly doubles peak memory versus float32 for no accuracy benefit at
+    the 0.98 threshold this uses -- cheap insurance against OOM on
+    memory-constrained runtimes (e.g. Colab's GPU tier, which trades RAM
+    for a GPU this script doesn't otherwise use)."""
     variances = df.var(numeric_only=True)
     keep = variances[variances > VAR_THRESH].index.tolist()
 
-    corr = df[keep].corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    corr = df[keep].astype(np.float32).corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
     to_drop = [c for c in upper.columns if any(upper[c] > CORR_THRESH)]
     keep = [c for c in keep if c not in to_drop]
+    del corr, upper
     return keep
 
 
@@ -697,8 +1041,10 @@ def compute_raw_features(df):
     frag_df = pd.DataFrame([fragment_counts(m) for m in mols])
     attach_df = pd.DataFrame([attachment_point_feats(m) for m in mols])
     conj_df = pd.DataFrame([conjugation_extent_feats(m) for m in mols])
+    extra_fp_df = pd.DataFrame([extra_fp_feats(m) for m in mols])
 
-    raw_df = pd.concat([raw_baseline_df, maccs_df, gast_df, frag_df, attach_df, conj_df], axis=1)
+    raw_df = pd.concat(
+        [raw_baseline_df, maccs_df, gast_df, frag_df, attach_df, conj_df, extra_fp_df], axis=1)
     return raw_df, valid_df
 
 
@@ -1064,13 +1410,22 @@ def model_names_for(tt):
 
 
 def boosting_default_params():
+    xgb_params = dict(n_estimators=300, max_depth=6, learning_rate=0.05,
+                       subsample=0.9, colsample_bytree=0.8, reg_lambda=1.0,
+                       random_state=RANDOM_STATE, n_jobs=N_JOBS, verbosity=0)
+    cat_params = dict(iterations=300, depth=6, learning_rate=0.05,
+                       l2_leaf_reg=3.0, random_state=RANDOM_STATE, verbose=False,
+                       thread_count=N_JOBS)
+    if GPU_AVAILABLE:
+        # tree_method='hist' + device='cuda' is XGBoost 2.x's GPU path
+        # (replaces the deprecated gpu_hist). task_type='GPU' is
+        # CatBoost's. Both no-op back to identical CPU behavior if
+        # GPU_AVAILABLE is False, since this whole block is skipped.
+        xgb_params.update(tree_method='hist', device='cuda')
+        cat_params.update(task_type='GPU', devices='0')
     return {
-        'XGB': dict(n_estimators=300, max_depth=6, learning_rate=0.05,
-                    subsample=0.9, colsample_bytree=0.8, reg_lambda=1.0,
-                    random_state=RANDOM_STATE, n_jobs=N_JOBS, verbosity=0),
-        'CatBoost': dict(iterations=300, depth=6, learning_rate=0.05,
-                          l2_leaf_reg=3.0, random_state=RANDOM_STATE, verbose=False,
-                          thread_count=N_JOBS),
+        'XGB': xgb_params,
+        'CatBoost': cat_params,
         'LightGBM': dict(n_estimators=300, max_depth=6, learning_rate=0.05,
                           subsample=0.9, colsample_bytree=0.8,
                           random_state=RANDOM_STATE, n_jobs=N_JOBS, verbosity=-1),
@@ -1283,7 +1638,7 @@ def get_zoo_factories(tt, accepted_tuned_configs, seed_offset=0):
 
 def boosting_search_space(trial, name):
     if name == 'XGB':
-        return dict(
+        params = dict(
             n_estimators=trial.suggest_int('n_estimators', 100, 800),
             max_depth=trial.suggest_int('max_depth', 3, 10),
             learning_rate=trial.suggest_float('learning_rate', 0.005, 0.3, log=True),
@@ -1293,8 +1648,11 @@ def boosting_search_space(trial, name):
             reg_alpha=trial.suggest_float('reg_alpha', 1e-4, 5.0, log=True),
             random_state=RANDOM_STATE, n_jobs=N_JOBS, verbosity=0,
         )
+        if GPU_AVAILABLE:
+            params.update(tree_method='hist', device='cuda')
+        return params
     if name == 'CatBoost':
-        return dict(
+        params = dict(
             # iterations capped at 400 (not 800) -- a (CatBoost, tg) combo
             # landed at 40.5 minutes in a real run, ~20x every other
             # combo's cost, almost entirely from trials near the top of
@@ -1306,6 +1664,11 @@ def boosting_search_space(trial, name):
             l2_leaf_reg=trial.suggest_float('l2_leaf_reg', 0.5, 20.0, log=True),
             random_state=RANDOM_STATE, verbose=False, thread_count=N_JOBS,
         )
+        if GPU_AVAILABLE:
+            params.update(task_type='GPU', devices='0')
+        else:
+            params['thread_count'] = N_JOBS
+        return params
     if name == 'LightGBM':
         return dict(
             n_estimators=trial.suggest_int('n_estimators', 100, 800),
@@ -2153,7 +2516,13 @@ def main():
 
     print("Featurizing train (baseline + MACCS + Gasteiger + Fragments + "
           "attachment-point + conjugation-extent)...")
-    raw_df, train_valid = compute_raw_features(train)
+    ckpt = load_ckpt('train_features')
+    if ckpt is not None:
+        raw_df, train_valid = ckpt
+        print(f"  loaded from checkpoint [{time.time()-t0:.0f}s]")
+    else:
+        raw_df, train_valid = compute_raw_features(train)
+        save_ckpt('train_features', (raw_df, train_valid))
     y_all = train_valid['target']
     target_types = sorted(train_valid['target_type'].unique())
     print(f"  {raw_df.shape[1]} raw features before pruning [{time.time()-t0:.0f}s]")
@@ -2238,11 +2607,28 @@ def main():
               f"({'WITH' if d3d_accepted[tt] else 'WITHOUT'} 3D-conformer block)")
 
     # ---- live hyperparameter tuning (must run in this execution -- see
-    # module docstring's rules-compliance note) ----
-    accepted_tuned_configs = tune_all_boosting_models(
-        X_by_target, y_all, train_valid, target_types, t0)
-    accepted_tuned_configs.update(
-        tune_all_extended_models(X_by_target, y_all, train_valid, target_types, t0))
+    # module docstring's rules-compliance note). Checkpointed: this is the
+    # single most expensive and most crash-prone stage (per-combo costs up
+    # to ~40min were observed in a real run), so a rerun after any crash
+    # here can skip straight to OOF stacking instead of repeating hours of
+    # Optuna search. Rules-compliant because this checkpoint is produced
+    # BY this exact run's own live search on this exact run's own
+    # featurized train.csv -- it's a resume mechanism for one execution
+    # attempt, not a value computed outside the graded run and replayed
+    # in (see module docstring's rules-compliance note on the earlier
+    # hardcoded-CatBoost-config violation this is careful not to repeat):
+    # delete checkpoints/ before a fresh graded run to guarantee a clean
+    # from-scratch execution. ----
+    accepted_tuned_configs = load_ckpt('accepted_tuned_configs')
+    if accepted_tuned_configs is not None:
+        print(f"\n  loaded {len(accepted_tuned_configs)} tuned config(s) from checkpoint "
+              f"[{time.time()-t0:.0f}s]")
+    else:
+        accepted_tuned_configs = tune_all_boosting_models(
+            X_by_target, y_all, train_valid, target_types, t0)
+        accepted_tuned_configs.update(
+            tune_all_extended_models(X_by_target, y_all, train_valid, target_types, t0))
+        save_ckpt('accepted_tuned_configs', accepted_tuned_configs)
     print(f"\n  {len(accepted_tuned_configs)} accepted tuned config(s): "
           f"{list(accepted_tuned_configs.keys())}")
 
@@ -2262,11 +2648,12 @@ def main():
     test_frag = pd.Series([fragment_counts(m) for m in test_mols], index=test_mols.index)
     test_attach = pd.Series([attachment_point_feats(m) for m in test_mols], index=test_mols.index)
     test_conj = pd.Series([conjugation_extent_feats(m) for m in test_mols], index=test_mols.index)
+    test_extra_fp = pd.Series([extra_fp_feats(m) for m in test_mols], index=test_mols.index)
 
     valid_test_idx = test.index[test_valid_mask]
     test_records = [
         {**test_feats[idx], **test_maccs[idx], **test_gast[idx], **test_frag[idx],
-         **test_attach[idx], **test_conj[idx]}
+         **test_attach[idx], **test_conj[idx], **test_extra_fp[idx]}
         for idx in valid_test_idx
     ]
     # Two reindexed views mirroring X_base/X_xt, built unconditionally the
