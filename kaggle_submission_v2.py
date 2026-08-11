@@ -223,6 +223,7 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import r2_score
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -286,18 +287,103 @@ PL_CONF_CANDIDATES = [0.65, 0.8]
 # Same proven mechanism (evaluate_pl_conf_fraction), one more target.
 PL_CONF_SEARCH_TARGETS = {'eps', 'ei', 'nc'}
 
-# GNN track CLOSED. The 3-seed multi-task export (gnn_mt_export.log) settled
-# it: pooled OOF R2 lost to the tuned 8-model stack on every one of the 5
-# candidate targets, by real margins, not noise --
-#   eps 0.7529 vs 0.8014 (-0.0485), ei 0.7968 vs 0.8329 (-0.0361),
-#   nc  0.8364 vs 0.8558 (-0.0194), egc 0.9037 vs 0.9201 (-0.0164),
-#   tg  0.8997 vs 0.9111 (-0.0114).
-# An empty set short-circuits the whole GNN path in process_target (the
-# `if tt in GNN_STACK_TARGETS` guard is never true), so a run loads no
-# gnn_oof_*/gnn_test_* files and never invokes evaluate_gnn_stack_column.
-# load_gnn_predictions/evaluate_gnn_stack_column are left defined but unused;
-# re-enable by listing targets here only if that verdict is ever overturned.
-GNN_STACK_TARGETS = set()
+# GNN 9th-column: egc/tg ONLY. A from-scratch single-task D-MPNN (chemprop)
+# is trained FRESH IN THIS PROCESS for each of these targets and its
+# out-of-fold predictions offered as a 9th stacking column -- see
+# get_gnn_predictions / compute_gnn_predictions. Those columns cleared the
+# real paired gate in full runs (+0.0084/+0.0059 vs floors 0.0034/0.0038;
+# the gate uses get_xtarget_eval_splits' 15-fold paired delta, identical
+# methodology to paired_delta_verdict -- the small floor is genuine,
+# confirmed ~unchanged at 5 vs 15 folds, because adding one clean prediction
+# column to a Ridge stack is far more stable fold-to-fold than adding a
+# 500-col feature block to LightGBM, which is where the 0.0097-0.0218 floors
+# come from).
+#
+# COMPLIANCE: training the GNN from scratch inside the run is explicitly
+# allowed (rule 6.2.3 -- public architecture code, weights trained fresh, no
+# pretrained/cached artifacts). The earlier CSV-export approach was
+# offline-eval-only and would NOT have been submittable; this trains live.
+# On Kaggle, chemprop must be available in the kernel (add it as a dataset/
+# utility if the kernel has no internet) -- if the import fails the GNN
+# column is skipped fail-soft, the rest of the pipeline is unaffected.
+#
+# egb/eea added as gated shots: both are electronic-structure properties
+# (bulk band gap / electron affinity) -- the exact class the GNN helped on
+# for egc -- and, being mid-size targets (337/221 rows), their 9th-column
+# paired noise floor is small enough that a modest consistent GNN gain can
+# actually clear it. That's the key lesson from full_run_v3: on egc/tg the
+# floor was ~0.003 so +0.006-0.008 cleared, whereas eps/ei/nc floors were
+# 0.03-0.04 so nothing incremental ever clears there. eps/ei/nc stay
+# EXCLUDED: the multi-task export (gnn_mt_export.log) lost to the stack on
+# every one (eps -0.0485, ei -0.0361, nc -0.0194) and single-task lost too.
+# Every target here is still re-checked live by the gate, so egb/eea only
+# ship if they clear their own floor -- they may well reject.
+GNN_STACK_TARGETS = {'egc', 'tg', 'egb', 'eea'}
+
+# In-notebook GNN training config (compute_gnn_predictions). Deliberately
+# chemprop's stock D-MPNN at defaults -- this is a small +0.006-0.008 lever
+# on egc/tg, not worth bespoke tuning. GNN_BAG_SEEDS averages
+# fresh-initialised models per fit to damp seed noise (Day-1 fold R2 std was
+# 0.007-0.13); drop it to 1-2 to cut runtime on Kaggle if needed.
+GNN_BAG_SEEDS = 3
+# egb/eea are small-N (337/221) and their GNN OOF is the noisiest -- and both
+# were borderline at the 9th-column gate (egb's GNN 0.918 sits just below its
+# 0.937 stack). More bag seeds is pure variance reduction (no overfit risk),
+# so it's exactly the right lever there: a cleaner OOF column clears the gate
+# more reliably and gets weighted more. egc/tg stay at the default 3 -- they
+# already clear and are stable (tg fold std 0.010), and re-bagging tg (4,143
+# rows) is the expensive path for negligible gain.
+GNN_BAG_SEEDS_BY_TARGET = {'egb': 8, 'eea': 8}
+
+# Targets that get a DEDICATED cross-property model as an extra stacking
+# column (compute_xprop_predictions): a LightGBM trained ONLY on the
+# cross-target values + known-flags + physics transforms (nc^2, band-gap
+# identities), no descriptors. The physics features are also in the main
+# descriptor matrix (physics_cross_feats), but there they're diluted among
+# ~700 columns and averaged with 7 other models incl. linear ones that
+# can't use nc^2; an un-diluted focused model, offered as its own column,
+# lets the meta-learner weight the cross-property signal directly. Gated
+# per target like everything else. The 5 small targets are exactly the ones
+# with strong, high-coverage physical links (corr(eps,nc^2)=0.925; band gap
+# = ionization - electron affinity), and the ones dragging the mean.
+# Re-enabled after the v7 physdelta test-matrix bug was fixed (XProp itself
+# never had that bug -- its test-side used xprop_test correctly). Gated per
+# target; LB is the final arbiter.
+XPROP_TARGETS = {'egb', 'ei', 'eea', 'eps', 'nc'}
+
+# MLP stacking column. A small feed-forward net on the descriptor matrix is a
+# genuinely DIFFERENT model class from the 8 tree/linear/instance base models
+# and from the GNN (which sees the graph, not descriptors) -- so its errors are
+# structurally decorrelated from theirs, which is exactly what a stacking
+# meta-learner can exploit. The v9 impute-then-anchor negative result was the
+# motivation: a stacking column earns its place by COMPLEMENTARITY, not
+# standalone accuracy; kept ONLY where it clears the same paired-delta noise
+# floor as GNN/XProp/PhysDelta, never added to the always-on zoo (a 9th
+# always-on column was net-negative before; see model_names_for).
+#
+# Restricted to tg (4143 rows) and egc (2028) -- the only two targets with
+# enough data for a net. A smoke test (scratchpad/smoke_mlp.py) confirmed the
+# net is viable + complementary there (egc: MLP OOF 0.846, error-corr 0.72 vs
+# LightGBM) but CATASTROPHIC on the ~220-337-row small targets (eps OOF -1.98,
+# ei -3.64 -- a net starves on that little data). Honest limitation: this helps
+# only the already-strong large targets, not the weak small ones dragging the
+# mean, so its ceiling is a modest mean-CV gain.
+MLP_TARGETS = {'tg', 'egc'}
+GNN_D_H = 300
+GNN_DEPTH = 3
+GNN_DROPOUT = 0.0
+GNN_FFN_HIDDEN = 300
+GNN_FFN_LAYERS = 1
+GNN_INNER_VAL_SPLITS = 9  # inner canonical-SMILES-grouped split for early stopping
+GNN_TARGET_CONFIG = {
+    'egc': dict(batch_size=64, max_epochs=250, patience=20),
+    'tg':  dict(batch_size=64, max_epochs=250, patience=20),
+    # egb/eea are small-N (337/221) -- smaller batch + longer budget +
+    # more patience, mirroring gnn_prototype.py's small-target settings.
+    'egb': dict(batch_size=32, max_epochs=300, patience=40),
+    'eea': dict(batch_size=16, max_epochs=300, patience=40),
+}
+GNN_DEFAULT_CONFIG = dict(batch_size=64, max_epochs=250, patience=20)
 
 
 # ---------------------------------------------------------------------------
@@ -875,8 +961,45 @@ def cross_target_feats(df, lookup):
         if own_mask.any():
             vals.loc[own_mask, tt] = np.nan
     known = vals.notna().astype(int).add_prefix('known_')
+    # Physics transforms of the raw cross-target values (see physics_cross_feats).
+    # NOTE: v7's LB crash (0.876->0.783) was traced to a BUG in
+    # compute_physdelta_predictions (it used the TRAIN feature matrix for TEST
+    # rows via integer-index collision), not to these features leaking. Bug
+    # fixed; re-enabled and re-tested against the real LB.
+    phys = physics_cross_feats(vals)
     vals = vals.add_prefix('xtarget_')
-    return pd.concat([vals, known], axis=1)
+    return pd.concat([vals, known, phys], axis=1)
+
+
+def physics_cross_feats(vals):
+    """Physically-motivated nonlinear combinations of the raw cross-target
+    values (`vals`: columns are target_type names, own-target already
+    blanked to NaN). Each column is defined only where its inputs are known
+    (NaN otherwise -- imputed downstream like every other feature). These
+    encode the two strong structure-property identities in this dataset:
+
+      * dielectric constant ~ refractive index^2  (eps ~ nc^2), from the
+        Lorentz-Lorenz relation at the optical-frequency limit -- the
+        single strongest cross-property link here;
+      * fundamental band gap = ionization energy - electron affinity
+        (egb ~ ei - eea, and its rearrangements) -- so a molecule's known
+        ei/eea pin down egb, known egb/eea pin down ei, etc.
+    """
+    cols = vals.columns
+    out = {}
+    if 'nc' in cols:
+        out['phys_nc_sq'] = vals['nc'] ** 2                       # -> estimates eps
+    if 'eps' in cols:
+        out['phys_eps_sqrt'] = np.sqrt(vals['eps'].clip(lower=0))  # -> estimates nc
+    if 'ei' in cols and 'eea' in cols:
+        out['phys_gap_from_ie_ea'] = vals['ei'] - vals['eea']     # -> estimates egb/egc
+    if 'egb' in cols and 'eea' in cols:
+        out['phys_ie_from_egb_ea'] = vals['egb'] + vals['eea']    # -> estimates ei
+    if 'egc' in cols and 'eea' in cols:
+        out['phys_ie_from_egc_ea'] = vals['egc'] + vals['eea']    # -> estimates ei
+    if 'ei' in cols and 'egb' in cols:
+        out['phys_ea_from_ie_egb'] = vals['ei'] - vals['egb']     # -> estimates eea
+    return pd.DataFrame(out, index=vals.index)
 
 
 def get_xtarget_eval_splits(df, target_type, n_repeats=N_REPEATS_SMALL, base_seed=RANDOM_STATE):
@@ -1686,6 +1809,162 @@ def fit_predict_full(model_factory, X_tr_df, y_tr_series, X_te_df, sample_weight
         model_factory, X_tr_df, y_tr_series, [X_te_df], sample_weight)[0]
 
 
+# Physics-anchored delta targets. For a target with a strong, known
+# structure-property law, predicting the RESIDUAL against the law's estimate
+# (target - anchor) rather than the target itself is far stronger than
+# handing the anchor in as a feature: a target transform changes what the
+# model learns, whereas a feature transform like nc^2 is invisible to trees
+# (monotonic-invariant, confirmed in v6). Each anchor is a function of OTHER
+# properties' cross-target values (leak-free, own-target already blanked),
+# defined only where its inputs are known. Probe results on anchor rows:
+# nc 0.829->0.902, eps 0.733->0.848, ei 0.589->0.639 (direct->delta).
+# Re-enabled after fixing the test-matrix bug in compute_physdelta_predictions
+# (v7's crash was that bug, not the physics idea itself). Gated per target.
+PHYS_ANCHORS = {
+    'eps': lambda xt: xt['xtarget_nc'] ** 2,                      # eps ~ nc^2
+    'nc':  lambda xt: np.sqrt(xt['xtarget_eps'].clip(lower=0)),   # nc ~ sqrt(eps)
+    'ei':  lambda xt: xt['xtarget_egb'] + xt['xtarget_eea'],      # ei ~ egb + eea
+}
+
+# Impute-then-anchor. PHYS_ANCHORS above only fires on the rows that have a
+# *measured* (co-measured, exact-canonical-SMILES-match) partner property --
+# for eps that's only ~62% of rows; the other ~38% fall back to a plain direct
+# model, getting no physics at all. This table extends the physics to 100% of
+# rows: where the measured partner is missing, the anchor falls back to a
+# LEAK-SAFE *predicted* partner -- the very same dense pred_<prop> that
+# build_dense_predictions already produces and the feature-side paired-delta
+# gate already trusts (train side via the partner's K-fold ensemble, test side
+# via its 100%-refit bag -- no single model ever saw the row it predicts). So
+# this introduces no new modelling and no new leakage surface; it just widens
+# the anchor's coverage using estimates the pipeline already computes.
+#
+# Each entry: (partner props needed, fn(pred_frame)->anchor). Wired only where
+# the required dense pred_<partner> actually exists before the target is
+# processed (see main()'s dense_preds dict): eps<-pred_nc, ei<-pred_egb+pred_eea.
+# nc would need pred_eps, which isn't computed before nc runs (nc precedes eps),
+# so nc keeps measured-only anchoring.
+# DISABLED after the v9 experiment (empty = no-op; measured-only anchoring,
+# identical to v8). NEGATIVE RESULT worth keeping: imputing the blind rows with
+# a *predicted* partner (eps<-pred_nc, ei<-pred_egb+pred_eea) made the
+# physics-delta column individually more accurate but MORE REDUNDANT with the
+# XProp cross-property column that's already in the stack -- so its marginal
+# contribution collapsed (eps +PhysDelta fell from ~+0.018 in v8 to +0.0073,
+# below the 0.0104 noise floor -> rejected), and eps regressed 0.8669 -> 0.8486
+# (mean CV 0.8951 -> 0.8925). A stacking column's value is its complementarity,
+# not its standalone accuracy; feeding it the same nc signal XProp already uses
+# destroyed that. The machinery below (_impute_anchor, dense_preds wiring) is
+# left in place, dormant, in case a *complementary* imputation is ever found.
+PHYS_IMPUTE_ANCHORS = {}
+
+
+def _impute_anchor(tt, anchor_tr_all, anchor_te_all, pred_partners):
+    """Fill the measured-anchor gaps (NaN rows) with a physics anchor built
+    from LEAK-SAFE predicted partner properties. Returns the merged
+    (anchor_tr_all, anchor_te_all) -- measured values are always preferred
+    where present; predicted only fills the holes. A no-op (returns the inputs
+    unchanged) unless tt has an impute rule AND every partner it needs is
+    present in pred_partners."""
+    if not pred_partners or tt not in PHYS_IMPUTE_ANCHORS:
+        return anchor_tr_all, anchor_te_all
+    partner_props, combine = PHYS_IMPUTE_ANCHORS[tt]
+    if not all(pp in pred_partners for pp in partner_props):
+        return anchor_tr_all, anchor_te_all
+    ptr = pd.DataFrame({pp: pred_partners[pp][0] for pp in partner_props})
+    pte = pd.DataFrame({pp: pred_partners[pp][1] for pp in partner_props})
+    imp_tr = combine(ptr).reindex(anchor_tr_all.index)
+    imp_te = combine(pte).reindex(anchor_te_all.index)
+    anchor_tr_all = anchor_tr_all.fillna(imp_tr)
+    anchor_te_all = anchor_te_all.fillna(imp_te)
+    return anchor_tr_all, anchor_te_all
+
+
+def compute_physdelta_predictions(tt, X_feat_train, X_feat_test, xprop_train, xprop_test,
+                                  y_all, train_valid, test, pred_partners=None):
+    """Physics-anchored delta model for tt as a stacking column. On rows
+    where the anchor property is known, a LightGBM learns the RESIDUAL
+    (target - anchor) and the prediction is anchor + residual; on rows
+    without the anchor it falls back to a direct LightGBM. Both use the full
+    per-target feature matrix (descriptors + cross-target), so the residual
+    model can still use structure. Returns (oof_series, test_series) or None.
+
+    Leak-free: the anchor is built from other properties' train values
+    (own-target blanked in cross_target_feats), and both sub-models are fit
+    per-fold on training rows only, exactly like generate_oof."""
+    if tt not in PHYS_ANCHORS:
+        return None
+    # Align the test feature matrix to the train matrix's exact columns/order
+    # -- the constant-column mask fitted on train is applied positionally to
+    # test, so the two MUST share column layout. (The v7 bug used the train
+    # matrix for test rows via integer-index collision; passing + aligning an
+    # explicit test matrix is the fix.)
+    X_feat_test = X_feat_test.reindex(columns=X_feat_train.columns)
+    anchor_tr_all = PHYS_ANCHORS[tt](xprop_train)
+    anchor_te_all = PHYS_ANCHORS[tt](xprop_test)
+    sub_index, repeats = get_harness_splits(train_valid, tt)
+    n_measured = int(anchor_tr_all.loc[sub_index].notna().sum())
+    # Impute-then-anchor: extend the anchor from the co-measured subset to
+    # 100% of rows using leak-safe predicted partner properties (dense
+    # pred_<partner>). Measured partners are always preferred; predicted only
+    # fills the gaps. See PHYS_IMPUTE_ANCHORS / _impute_anchor.
+    anchor_tr_all, anchor_te_all = _impute_anchor(
+        tt, anchor_tr_all, anchor_te_all, pred_partners)
+    n_imputed = int(anchor_tr_all.loc[sub_index].notna().sum()) - n_measured
+    if anchor_tr_all.loc[sub_index].notna().sum() < PL_MIN_ROWS:
+        return None                       # too few anchor rows to bother
+
+    def lgb():
+        return LGBMRegressor(n_estimators=400, learning_rate=0.05, num_leaves=31,
+                             subsample=0.9, colsample_bytree=0.8, verbose=-1,
+                             random_state=RANDOM_STATE, n_jobs=N_JOBS)
+
+    y = y_all
+    accum = np.zeros(len(sub_index), dtype=float)
+    for folds in repeats:
+        for tr_pos, va_pos in folds:
+            tr_idx, va_idx = sub_index[tr_pos], sub_index[va_pos]
+            Xtr = X_feat_train.loc[tr_idx].values.astype(float)
+            Xva = X_feat_train.loc[va_idx].values.astype(float)
+            keep = constant_column_mask(Xtr)
+            Xtr, Xva = Xtr[:, keep], Xva[:, keep]
+            ytr = y.loc[tr_idx].values
+            a_tr = anchor_tr_all.loc[tr_idx].values
+            a_va = anchor_tr_all.loc[va_idx].values
+            has_tr, has_va = ~np.isnan(a_tr), ~np.isnan(a_va)
+
+            direct = lgb().fit(Xtr, ytr)         # fallback for anchor-less rows
+            pred = direct.predict(Xva)
+            if has_tr.sum() >= PL_MIN_ROWS and has_va.any():
+                resid = lgb().fit(Xtr[has_tr], ytr[has_tr] - a_tr[has_tr])
+                pred[has_va] = a_va[has_va] + resid.predict(Xva[has_va])
+            accum[va_pos] += pred
+    oof = pd.Series(accum / len(repeats), index=sub_index)
+
+    test_series = pd.Series(np.nan, index=test.index, dtype=float)
+    te_rows = test.index[(test['target_type'] == tt).values]
+    if len(te_rows) > 0:
+        Xtr = X_feat_train.loc[sub_index].values.astype(float)
+        keep = constant_column_mask(Xtr)
+        Xtr = Xtr[:, keep]
+        Xte = X_feat_test.loc[te_rows].values.astype(float)[:, keep]   # FIXED: test matrix
+        ytr = y.loc[sub_index].values
+        a_tr = anchor_tr_all.loc[sub_index].values
+        a_te = anchor_te_all.loc[te_rows].values
+        has_tr, has_te = ~np.isnan(a_tr), ~np.isnan(a_te)
+        direct = lgb().fit(Xtr, ytr)
+        preds = direct.predict(Xte)
+        if has_tr.sum() >= PL_MIN_ROWS and has_te.any():
+            resid = lgb().fit(Xtr[has_tr], ytr[has_tr] - a_tr[has_tr])
+            preds[has_te] = a_te[has_te] + resid.predict(Xte[has_te])
+        test_series.loc[te_rows] = preds
+
+    n_anchor = int(anchor_tr_all.loc[sub_index].notna().sum())
+    imp_note = f", {n_imputed} imputed" if n_imputed else ""
+    print(f"  {tt:5s}: physics-delta model built (OOF R2="
+          f"{r2_score(y.loc[sub_index].values, oof.loc[sub_index].values):.4f}, "
+          f"{n_anchor}/{len(sub_index)} anchor rows [{n_measured} measured{imp_note}])")
+    return oof, test_series
+
+
 def _find_gnn_file(name):
     """Locate a saved GNN prediction file next to the data or next to this
     script. Returns None if absent -- every GNN code path in this file is
@@ -1746,11 +2025,298 @@ def load_gnn_predictions(tt, train_valid, test):
     return oof, test_series
 
 
-def evaluate_gnn_stack_column(tt, oof_df, gnn_oof, y_all, train_valid, t0):
-    """Accept/reject the saved GNN prediction as a 9th column of tt's OOF
-    matrix, against the real tuned 8-model stack -- not the deliberately
-    weak untuned LightGBM proxy used for feature-block decisions elsewhere,
-    which would overstate the gain by comparing against a much lower bar.
+# ---------------------------------------------------------------------------
+# In-notebook GNN training (chemprop D-MPNN, from scratch). This is the
+# SHIPPED path: on Kaggle there is no CSV cache, so compute_gnn_predictions
+# trains the GNN fresh in-process. Locally, get_gnn_predictions prefers the
+# CSV cache when present -- both for speed and because on macOS importing
+# torch alongside the already-loaded LightGBM segfaults (OpenMP double-load);
+# the cache path never imports torch. chemprop is imported LAZILY here for
+# the same reason -- nothing torch-related loads unless we actually train.
+# ---------------------------------------------------------------------------
+_GNN = {}
+
+
+def _gnn_setup():
+    """Lazy one-time chemprop import + featurizer build. Raises ImportError
+    if chemprop isn't installed, which get_gnn_predictions catches to skip
+    the GNN column fail-soft."""
+    if _GNN:
+        return _GNN
+    import lightning.pytorch as pl
+    from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+    from chemprop import data as cp_data, models as cp_models, nn as cp_nn
+    from chemprop.featurizers import (MultiHotAtomFeaturizer,
+                                      SimpleMoleculeMolGraphFeaturizer)
+    import torch
+    torch.set_float32_matmul_precision('medium')
+
+    # Give the polymer wildcard atom `*` (atomic number 0) its own one-hot
+    # channel instead of sharing the stock featurizer's "other" bucket with
+    # rare heavy atoms -- it's the single most load-bearing atom type in this
+    # dataset (present in every molecule). Same fix as gnn_prototype.py.
+    base = MultiHotAtomFeaturizer.v2()
+    seq = lambda x: list(x.keys()) if isinstance(x, dict) else list(x)
+    nums = seq(base.atomic_nums)
+    for z in (0, 48, 50, 52, 82):  # *, Cd, Sn, Te, Pb -- all present in train/test
+        if z not in nums:
+            nums.append(z)
+    atom_f = MultiHotAtomFeaturizer(
+        atomic_nums=nums, degrees=seq(base.degrees),
+        formal_charges=seq(base.formal_charges), chiral_tags=seq(base.chiral_tags),
+        num_Hs=seq(base.num_Hs), hybridizations=seq(base.hybridizations))
+    _GNN.update(
+        pl=pl, ES=EarlyStopping, MC=ModelCheckpoint, cp_data=cp_data,
+        cp_models=cp_models, cp_nn=cp_nn, torch=torch,
+        featurizer=SimpleMoleculeMolGraphFeaturizer(atom_featurizer=atom_f),
+        accel=('gpu' if torch.cuda.is_available() else 'cpu'))
+    return _GNN
+
+
+def _gnn_fit_predict(mols, y_model, canon, tr_pos, eval_mol_lists, cfg, seed, work_dir):
+    """Train one D-MPNN on tr_pos (inner canon-grouped split for early
+    stopping) and predict each molecule list in eval_mol_lists. Returns a
+    list of prediction arrays on y_model's scale (the UnscaleTransform undoes
+    the per-fold target standardisation)."""
+    g = _gnn_setup()
+    pl, cp_data, cp_models, cp_nn = g['pl'], g['cp_data'], g['cp_models'], g['cp_nn']
+    featurizer = g['featurizer']
+    pl.seed_everything(seed, workers=True, verbose=False)
+
+    inner_groups = canon[tr_pos]
+    n_inner = min(GNN_INNER_VAL_SPLITS, len(np.unique(inner_groups)))
+    gkf = GroupKFold(n_splits=n_inner, shuffle=True, random_state=seed)
+    itr, iva = next(iter(gkf.split(np.zeros(len(tr_pos)), groups=inner_groups)))
+    abs_tr, abs_iva = tr_pos[itr], tr_pos[iva]
+
+    def dset(idx):
+        dps = [cp_data.MoleculeDatapoint(mol=mols[i], y=np.array([y_model[i]], dtype=float))
+               for i in idx]
+        return cp_data.MoleculeDataset(dps, featurizer)
+
+    train_dset = dset(abs_tr)
+    scaler = train_dset.normalize_targets()          # fit on train fold only
+    ival_dset = dset(abs_iva)
+    ival_dset.normalize_targets(scaler)              # reuse, never refit
+    bs = min(cfg['batch_size'], max(4, len(abs_tr) // 4))
+    train_loader = cp_data.build_dataloader(train_dset, batch_size=bs, num_workers=0,
+                                            shuffle=True, seed=seed)
+    ival_loader = cp_data.build_dataloader(ival_dset, batch_size=bs, num_workers=0,
+                                           shuffle=False)
+    eval_loaders = []
+    for ml in eval_mol_lists:
+        dps = [cp_data.MoleculeDatapoint(mol=m, y=np.array([0.0])) for m in ml]
+        eval_loaders.append(cp_data.build_dataloader(
+            cp_data.MoleculeDataset(dps, featurizer), batch_size=64, num_workers=0,
+            shuffle=False))
+
+    mp = cp_nn.BondMessagePassing(d_v=featurizer.atom_fdim, d_e=featurizer.bond_fdim,
+                                  d_h=GNN_D_H, depth=GNN_DEPTH, dropout=GNN_DROPOUT)
+    ffn = cp_nn.RegressionFFN(
+        input_dim=GNN_D_H, hidden_dim=GNN_FFN_HIDDEN, n_layers=GNN_FFN_LAYERS,
+        dropout=GNN_DROPOUT,
+        output_transform=cp_nn.UnscaleTransform.from_standard_scaler(scaler))
+    model = cp_models.MPNN(mp, cp_nn.MeanAggregation(), ffn, batch_norm=True,
+                           metrics=[cp_nn.RMSE()])
+    ckpt = g['MC'](dirpath=work_dir, filename="best", save_top_k=1,
+                   monitor="val_loss", mode="min", save_last=False)
+    trainer = pl.Trainer(
+        accelerator=g['accel'], devices=1, max_epochs=cfg['max_epochs'],
+        logger=False, enable_progress_bar=False, enable_model_summary=False,
+        enable_checkpointing=True,
+        callbacks=[ckpt, g['ES'](monitor="val_loss", mode="min", patience=cfg['patience'])],
+        num_sanity_val_steps=0, deterministic=False)
+    trainer.fit(model, train_loader, ival_loader)
+    best = (cp_models.MPNN.load_from_checkpoint(ckpt.best_model_path)
+            if ckpt.best_model_path else model)
+    outs = []
+    for loader in eval_loaders:
+        raw = trainer.predict(best, loader)
+        outs.append(np.concatenate([p.detach().cpu().numpy().reshape(-1) for p in raw]))
+    return outs
+
+
+def compute_gnn_predictions(tt, train_valid, test):
+    """Train a from-scratch single-task D-MPNN for tt and return
+    (oof_series over train_valid.index, test_series over test.index) -- the
+    same shape load_gnn_predictions returns, so evaluate_gnn_stack_column is
+    agnostic to which produced it.
+
+    OOF uses get_harness_splits' exact folds (so the column is a valid,
+    leak-free 9th stack member on the identical splits as the other 8), and
+    both OOF and the test refit are seed-bagged over GNN_BAG_SEEDS. Raises
+    ImportError (via _gnn_setup) if chemprop is unavailable."""
+    import shutil
+    import tempfile
+
+    _gnn_setup()  # fail fast with ImportError if chemprop missing
+    cfg = GNN_TARGET_CONFIG.get(tt, GNN_DEFAULT_CONFIG)
+    n_seeds = GNN_BAG_SEEDS_BY_TARGET.get(tt, GNN_BAG_SEEDS)
+    sub_index, repeats = get_harness_splits(train_valid, tt)
+    sub = train_valid.loc[sub_index]
+    y_true = sub['target'].to_numpy(dtype=float)
+    canon = sub['canon'].to_numpy()
+    mols = [_parse_mol(s) for s in sub['smiles']]
+    transform = TARGET_TRANSFORMS.get(tt)
+    y_model = transform[0](y_true) if transform is not None else y_true
+
+    te_mask = (test['target_type'] == tt).to_numpy()
+    te_rows = test.index[te_mask]
+    te_mols_all = [_parse_mol(s) for s in test.loc[te_rows, 'smiles']]
+    keep = [i for i, m in enumerate(te_mols_all) if m is not None]
+    te_rows_valid = te_rows[np.array(keep, dtype=int)] if keep else te_rows[:0]
+    te_mols = [te_mols_all[i] for i in keep]
+
+    work = Path(tempfile.mkdtemp(prefix=f"gnn_{tt}_"))
+    try:
+        # ---- OOF, seed-bagged within each fold ----
+        oof_accum = np.zeros(len(sub), dtype=float)
+        for r, folds in enumerate(repeats):
+            for k, (tr_pos, va_pos) in enumerate(folds):
+                seed_preds = []
+                for s in range(n_seeds):
+                    seed = RANDOM_STATE + 1000 * r + 10 * k + s
+                    outs = _gnn_fit_predict(
+                        mols, y_model, canon, tr_pos,
+                        [[mols[i] for i in va_pos]], cfg, seed, work / f"o{r}_{k}_{s}")
+                    seed_preds.append(outs[0])
+                p = np.mean(seed_preds, axis=0)
+                if transform is not None:
+                    p = transform[1](p)
+                oof_accum[va_pos] += p
+        oof = oof_accum / len(repeats)
+        oof_series = pd.Series(np.nan, index=train_valid.index, dtype=float)
+        oof_series.loc[sub_index] = oof
+
+        # ---- test, seed-bagged refit on 100% of tt's rows ----
+        test_series = pd.Series(np.nan, index=test.index, dtype=float)
+        if len(te_mols) > 0:
+            all_pos = np.arange(len(sub))
+            te_preds = []
+            for s in range(n_seeds):
+                outs = _gnn_fit_predict(mols, y_model, canon, all_pos, [te_mols], cfg,
+                                        RANDOM_STATE + 500 + s, work / f"refit_{s}")
+                te_preds.append(outs[0])
+            te_pred = np.mean(te_preds, axis=0)
+            if transform is not None:
+                te_pred = transform[1](te_pred)
+            test_series.loc[te_rows_valid] = te_pred
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    print(f"  {tt:5s}: trained GNN in-process (OOF R2={r2_score(y_true, oof):.4f}, "
+          f"{n_seeds} seeds/fit)")
+    return oof_series, test_series
+
+
+def get_gnn_predictions(tt, train_valid, test):
+    """GNN predictions for tt: use the CSV cache if present (local fast path,
+    and avoids the macOS torch+LightGBM segfault by never importing torch),
+    otherwise train fresh in-process -- the path that runs on Kaggle. Returns
+    None (skips the GNN column) if neither works."""
+    cached = load_gnn_predictions(tt, train_valid, test)
+    if cached is not None:
+        print(f"  {tt:5s}: using cached GNN predictions (gnn_oof_{tt}.csv)")
+        return cached
+    try:
+        return compute_gnn_predictions(tt, train_valid, test)
+    except ImportError:
+        print(f"  {tt:5s}: chemprop unavailable -- GNN column skipped fail-soft "
+              f"(add chemprop to the kernel to enable in-notebook GNN training)")
+        return None
+
+
+def compute_xprop_predictions(tt, xprop_train, xprop_test, y_all, train_valid, test):
+    """Dedicated cross-property model for tt: a LightGBM trained ONLY on the
+    cross-target/physics matrix (xprop_train = cross_target_feats output --
+    xtarget_/known_/phys_ columns, own-target already blanked per row), on
+    get_harness_splits' exact folds. Returns (oof_series, test_series) shaped
+    like the GNN's, or None if tt's rows carry no cross-property signal.
+
+    LightGBM handles NaN natively, so 'partner property not measured' stays a
+    real missing-value signal rather than being imputed away. wrap_for_target
+    keeps eps/ei in log space so this column is on the same scale as the 8
+    base OOF columns it joins. Leak-free for the same reason the xtarget
+    block is: every feature is another property's train value, never tt's own
+    label (blanked in cross_target_feats)."""
+    sub_index, repeats = get_harness_splits(train_valid, tt)
+    Xtt = xprop_train.loc[sub_index]
+    if Xtt.notna().to_numpy().sum() == 0:      # no partner properties known at all
+        return None
+
+    factory = wrap_for_target(
+        lambda: LGBMRegressor(n_estimators=400, learning_rate=0.05, num_leaves=31,
+                              subsample=0.9, colsample_bytree=0.8, verbose=-1,
+                              random_state=RANDOM_STATE, n_jobs=N_JOBS), tt)
+    oof = generate_oof(factory, xprop_train, y_all, sub_index, repeats)
+
+    test_series = pd.Series(np.nan, index=test.index, dtype=float)
+    te_rows = test.index[(test['target_type'] == tt).values]
+    if len(te_rows) > 0:
+        preds = fit_predict_full(factory, xprop_train.loc[sub_index],
+                                 y_all.loc[sub_index], xprop_test.loc[te_rows])
+        test_series.loc[te_rows] = preds
+    print(f"  {tt:5s}: cross-property model built (OOF R2="
+          f"{r2_score(y_all.loc[sub_index].values, oof.loc[sub_index].values):.4f})")
+    return oof, test_series
+
+
+def mlp_factory(tt):
+    """Feed-forward net as a stacking column (see MLP_TARGETS). Pipeline
+    deliberately mirrors the Ridge/KNN shape -- median-impute -> standardize ->
+    SelectKBest to SELECT_K dims -- because a net needs scaled, dense, NaN-free
+    inputs (unlike the trees, which handle raw NaN matrices natively) and would
+    overfit a raw ~700-column descriptor matrix on the ~200-600-row small
+    targets; reducing to SELECT_K first is the same defense Ridge/KNN already
+    use. early_stopping holds out 10% internally to stop before overfitting.
+    wrap_for_target keeps eps/ei in log space, matching the other base columns
+    so this OOF column is on the same scale when it joins the stack."""
+    def make():
+        return Pipeline([
+            ('imp', SimpleImputer(strategy='median')),
+            ('sc', StandardScaler()),
+            ('kbest', SelectKBest(f_regression, k=SELECT_K)),
+            ('m', MLPRegressor(
+                hidden_layer_sizes=(128, 64), activation='relu', alpha=1e-3,
+                learning_rate_init=1e-3, max_iter=500, early_stopping=True,
+                validation_fraction=0.1, n_iter_no_change=15,
+                random_state=RANDOM_STATE)),
+        ])
+    return wrap_for_target(make, tt)
+
+
+def compute_mlp_predictions(tt, X_feat_train, X_feat_test, y_all, train_valid, test):
+    """MLP stacking column for tt, built on the SAME full per-target feature
+    matrix the 8 base models see (descriptors + whatever cross-target/dense
+    columns that target accepted). OOF via generate_oof on get_harness_splits'
+    folds; test via a single full refit -- shaped exactly like the GNN/XProp
+    columns so evaluate_gnn_stack_column can gate it identically. Returns
+    (oof_series, test_series). The test matrix is reindexed to the train
+    matrix's column layout before use, because fit_predict_multi applies the
+    train constant-column mask to test POSITIONALLY (the same alignment
+    discipline compute_physdelta_predictions uses)."""
+    sub_index, repeats = get_harness_splits(train_valid, tt)
+    factory = mlp_factory(tt)
+    oof = generate_oof(factory, X_feat_train, y_all, sub_index, repeats)
+
+    test_series = pd.Series(np.nan, index=test.index, dtype=float)
+    te_rows = test.index[(test['target_type'] == tt).values]
+    if len(te_rows) > 0:
+        Xte = X_feat_test.reindex(columns=X_feat_train.columns).loc[te_rows]
+        preds = fit_predict_full(factory, X_feat_train.loc[sub_index],
+                                 y_all.loc[sub_index], Xte)
+        test_series.loc[te_rows] = preds
+    print(f"  {tt:5s}: MLP model built (OOF R2="
+          f"{r2_score(y_all.loc[sub_index].values, oof.loc[sub_index].values):.4f})")
+    return oof, test_series
+
+
+def evaluate_gnn_stack_column(tt, oof_df, gnn_oof, y_all, train_valid, t0, col_name='GNN'):
+    """Accept/reject an extra prediction column (`col_name`, e.g. the GNN or
+    the cross-property model) as an additional column of tt's OOF matrix,
+    against the real tuned stack -- not the deliberately weak untuned
+    LightGBM proxy used for feature-block decisions elsewhere, which would
+    overstate the gain by comparing against a much lower bar.
 
     Uses the SAME split structure and paired statistic as
     paired_delta_verdict: get_xtarget_eval_splits' 3 independent seeds x
@@ -1775,7 +2341,7 @@ def evaluate_gnn_stack_column(tt, oof_df, gnn_oof, y_all, train_valid, t0):
     Returns (accepted, candidate_oof_df)."""
     sub_index, seed_folds = get_xtarget_eval_splits(train_valid, tt)
     cand = oof_df.copy()
-    cand['GNN'] = gnn_oof.loc[sub_index].to_numpy()
+    cand[col_name] = gnn_oof.loc[sub_index].to_numpy()
     meta = META_LEARNER_CANDIDATES['Ridge']
 
     a_scores, b_scores = [], []
@@ -1788,8 +2354,8 @@ def evaluate_gnn_stack_column(tt, oof_df, gnn_oof, y_all, train_valid, t0):
     delta, noise_floor = float(deltas.mean()), float(deltas.std())
     accepted = delta > noise_floor
 
-    print(f"  {tt:5s}: GNN 9th-column test ({len(a)} folds, 3-seed paired) -- "
-          f"8-model stack={a.mean():.4f}, +GNN={b.mean():.4f}, "
+    print(f"  {tt:5s}: {col_name} +column test ({len(a)} folds, 3-seed paired) -- "
+          f"stack={a.mean():.4f}, +{col_name}={b.mean():.4f}, "
           f"delta={delta:+.4f} vs noise floor {noise_floor:.4f} "
           f"({'ACCEPT' if accepted else 'reject'}) [{time.time()-t0:.0f}s]")
     return accepted, cand
@@ -1985,7 +2551,7 @@ def clip_bounds_for(tt, y_all, train_valid):
 def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, test,
                     test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
                     oof_meta, cv_scores, test_predictions, t0,
-                    track_fold_models=False):
+                    track_fold_models=False, xprop=None, dense_preds=None):
     """OOF stacking (generate OOF for every one of tt's own base models --
     see model_names_for -- select + fit the meta-learner) immediately
     followed by that target's own
@@ -2028,34 +2594,70 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
     oof_df = pd.DataFrame(oof_cols)[names]
     print(f"  {tt:5s}: OOF generated for all {len(names)} models [{time.time()-t0:.0f}s]")
 
-    # ---- GNN as a 9th stack column (egc/tg only, and only if
-    # gnn_prototype.py --export has been run). Decided live by the same
-    # paired accept/reject as every other optional block here, but against
-    # the real tuned stack rather than a proxy model. ----
-    gnn_test_col = None
+    # ---- Extra gated stacking columns beyond the 8-model zoo: the GNN
+    # (egc/tg/egb/eea) and the dedicated cross-property model (small
+    # targets). Each is offered as one more OOF column and kept only if it
+    # clears the same 15-fold paired gate. base_names captures the 8 zoo
+    # columns before any extra is added -- the dense pred_<tt> feature below
+    # (track_fold_models targets) uses the 8-model meta, since the extras
+    # span only tt's own rows, not the other targets' rows that feature is
+    # built for. extra_test_cols preserves oof_df column order so the
+    # test-side matrix lines up with the fitted meta-learner. ----
+    base_names = list(oof_df.columns)
+    extra_test_cols = []  # (name, test_series), in oof_df column order
+
     if tt in GNN_STACK_TARGETS:
-        loaded = load_gnn_predictions(tt, train_valid, test)
+        loaded = get_gnn_predictions(tt, train_valid, test)
         if loaded is None:
-            print(f"  {tt:5s}: no saved GNN predictions found -- 8-model stack unchanged")
+            print(f"  {tt:5s}: no GNN predictions available -- stack unchanged")
         else:
             gnn_oof, gnn_test = loaded
             accepted, cand_oof = evaluate_gnn_stack_column(
-                tt, oof_df, gnn_oof, y_all, train_valid, t0)
+                tt, oof_df, gnn_oof, y_all, train_valid, t0, col_name='GNN')
             if accepted:
-                if track_fold_models:
-                    # The dense pred_<tt> feature evaluates this target's
-                    # meta-learner on *other* targets' rows, which the saved
-                    # GNN column doesn't cover (it spans tt's own rows only).
-                    # Rather than materializing GNN predictions for every
-                    # other target's molecules, the dense feature keeps using
-                    # an 8-model meta-learner -- a deliberately small
-                    # difference, since that feature is an input to other
-                    # targets, not tt's own output.
-                    dense_meta = META_LEARNER_CANDIDATES['Ridge']()
-                    dense_meta.fit(oof_df.values, y_all.loc[sub_index].values)
-                    oof_meta[(tt, 'dense')] = dense_meta
                 oof_df = cand_oof
-                gnn_test_col = gnn_test
+                extra_test_cols.append(('GNN', gnn_test))
+
+    if tt in XPROP_TARGETS and xprop is not None:
+        xres = compute_xprop_predictions(tt, xprop[0], xprop[1], y_all, train_valid, test)
+        if xres is not None:
+            xoof, xtest = xres
+            accepted, cand_oof = evaluate_gnn_stack_column(
+                tt, oof_df, xoof, y_all, train_valid, t0, col_name='XProp')
+            if accepted:
+                oof_df = cand_oof
+                extra_test_cols.append(('XProp', xtest))
+
+    if tt in PHYS_ANCHORS and xprop is not None:
+        # FIXED: pass the TEST feature matrix (test_feat_df_by_target[tt])
+        # separately -- the v7 bug reused X_tt (train) for test rows via
+        # integer-index collision, producing garbage test predictions.
+        pres = compute_physdelta_predictions(
+            tt, X_tt, test_feat_df_by_target[tt], xprop[0], xprop[1],
+            y_all, train_valid, test, pred_partners=dense_preds)
+        if pres is not None:
+            poof, ptest = pres
+            accepted, cand_oof = evaluate_gnn_stack_column(
+                tt, oof_df, poof, y_all, train_valid, t0, col_name='PhysDelta')
+            if accepted:
+                oof_df = cand_oof
+                extra_test_cols.append(('PhysDelta', ptest))
+
+    if tt in MLP_TARGETS:
+        mres = compute_mlp_predictions(
+            tt, X_tt, test_feat_df_by_target[tt], y_all, train_valid, test)
+        if mres is not None:
+            moof, mtest = mres
+            accepted, cand_oof = evaluate_gnn_stack_column(
+                tt, oof_df, moof, y_all, train_valid, t0, col_name='MLP')
+            if accepted:
+                oof_df = cand_oof
+                extra_test_cols.append(('MLP', mtest))
+
+    if track_fold_models and extra_test_cols:
+        dense_meta = META_LEARNER_CANDIDATES['Ridge']()
+        dense_meta.fit(oof_df[base_names].values, y_all.loc[sub_index].values)
+        oof_meta[(tt, 'dense')] = dense_meta
 
     # Meta-learner selection (Task 3): tests Ridge(positive=True) against
     # the default Ridge on the OOF matrix via the real harness, same
@@ -2085,21 +2687,20 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
     if rows_valid.sum() > 0:
         X_te_tt = test_feat_df.loc[rows_valid, feature_cols_tt]
 
-        def _with_gnn(base_matrix):
-            """Append the saved GNN test column when it was accepted into
-            this target's stack, so the matrix width matches the 9-column
-            matrix oof_meta[tt] was fitted on. Unlike the 8 base models the
-            GNN column is not retrained during the pseudo-labeling round
-            below -- it is a fixed saved array, so it contributes the same
-            values to both passes."""
-            if gnn_test_col is None:
+        def _with_extra(base_matrix):
+            """Append every accepted extra column (GNN, XProp) in oof_df
+            order, so the test matrix width matches the matrix oof_meta[tt]
+            was fitted on. These are fixed arrays, not retrained in the
+            pseudo-labeling round below, so they contribute identically to
+            both passes."""
+            if not extra_test_cols:
                 return base_matrix
-            col = gnn_test_col.reindex(X_te_tt.index).to_numpy()
-            return np.column_stack([base_matrix, col])
+            cols = [s.reindex(X_te_tt.index).to_numpy() for _, s in extra_test_cols]
+            return np.column_stack([base_matrix] + cols)
 
         base_only_preds = bagged_refit_predict(
             tt, X_tr_tt, y_tr_tt, X_te_tt, accepted_tuned_configs, BAG_SEEDS)
-        base_test_preds = _with_gnn(base_only_preds)
+        base_test_preds = _with_extra(base_only_preds)
         first_pass_preds = oof_meta[tt].predict(base_test_preds)
 
         # ---- pseudo-labeling: test.csv is competition-provided, not
@@ -2146,7 +2747,7 @@ def process_target(tt, X_by_target, feature_cols_by_target, y_all, train_valid, 
                 np.ones(len(y_tr_tt)), np.full(int(conf_mask.sum()), PL_SAMPLE_WEIGHT),
             ])
 
-            base_test_preds_pl = _with_gnn(bagged_refit_predict(
+            base_test_preds_pl = _with_extra(bagged_refit_predict(
                 tt, X_aug, y_aug, X_te_tt, accepted_tuned_configs, PL_BAG_SEEDS, w_aug))
             print(f"  {tt:5s}: {int(conf_mask.sum())}/{len(conf_mask)} test rows "
                   f"pseudo-labeled, base models retrained [{time.time()-t0:.0f}s]")
@@ -2250,7 +2851,14 @@ def apply_dense_sources(source_fits, consumers, X_by_target, feature_cols_by_tar
 
     Factored out so a second group of sources (egb/eea -> nc/ei/eps) can
     reuse the identical build+prune+gate+augment logic as the original
-    egc/tg block, rather than duplicating it a third time."""
+    egc/tg block, rather than duplicating it a third time.
+
+    Returns (verdicts, dense_train_cols, dense_test_cols). The two col dicts
+    (keyed 'pred_<source>') are the raw dense series spanning all consumer
+    rows, returned regardless of the feature-side verdict so the caller can
+    reuse them for a *different* purpose -- the physics impute-then-anchor
+    (PHYS_IMPUTE_ANCHORS), which consumes a predicted partner property even
+    when it wasn't accepted as a plain feature."""
     dense_train_cols, dense_test_cols = {}, {}
     for tt_source, (X_tr_s, y_tr_s, fold_models) in source_fits.items():
         tr_series, te_series = build_dense_predictions(
@@ -2277,7 +2885,7 @@ def apply_dense_sources(source_fits, consumers, X_by_target, feature_cols_by_tar
             new_te = pd.DataFrame({n: s.loc[own_te] for n, s in dense_test_cols.items()})
             test_feat_df_by_target[tt] = pd.concat(
                 [test_feat_df_by_target[tt], new_te.reindex(test.index)], axis=1)
-    return verdicts
+    return verdicts, dense_train_cols, dense_test_cols
 
 
 # ---------------------------------------------------------------------------
@@ -2303,6 +2911,12 @@ def main():
     # pipeline below -- see evaluate_cross_target_features docstring for
     # why this uses a cheap LightGBM proxy instead of the full stack. ----
     cross_target_lookup = build_cross_target_lookup(train_valid)
+
+    # Cross-property-only matrix (xtarget_/known_/phys_ columns, own-target
+    # blanked per row) for the dedicated cross-property model
+    # (compute_xprop_predictions). Built once over all train rows here; the
+    # test half is built after test['canon'] is assigned below.
+    xprop_train = cross_target_feats(train_valid, cross_target_lookup)
 
     feature_cols_base = fit_feature_pruner(raw_df)
     X_base = raw_df[feature_cols_base]
@@ -2424,6 +3038,7 @@ def main():
     # those columns survived pruning.
     test['canon'] = test['smiles'].apply(canonical_smiles)
     test_xt_df = cross_target_feats(test, cross_target_lookup)
+    xprop_test = test_xt_df  # same matrix the cross-property model predicts on
     test_feat_df_xt = pd.DataFrame(test_records, index=valid_test_idx).reindex(
         index=test.index, columns=feature_cols_xt)
     for col in feature_cols_xt:
@@ -2473,7 +3088,7 @@ def main():
             tt, X_by_target, feature_cols_by_target, y_all, train_valid, test,
             test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
             oof_meta, cv_scores, test_predictions, t0,
-            track_fold_models=True)
+            track_fold_models=True, xprop=(xprop_train, xprop_test))
 
     # ---- Round 2 extension: dense pred_egc/pred_tg cross-target features
     # for the other 5 targets -- egc/tg's *model predictions*, not the
@@ -2551,15 +3166,28 @@ def main():
             tt, X_by_target, feature_cols_by_target, y_all, train_valid, test,
             test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
             oof_meta, cv_scores, test_predictions, t0,
-            track_fold_models=True)
+            track_fold_models=True, xprop=(xprop_train, xprop_test))
 
     egb_eea_consumers = [t for t in ('nc', 'ei', 'eps') if t in small_target_set]
-    egb_eea_verdicts = apply_dense_sources(
+    egb_eea_verdicts, egb_eea_train_cols, egb_eea_test_cols = apply_dense_sources(
         egb_eea_fits, egb_eea_consumers, X_by_target, feature_cols_by_target,
         test_feat_df_by_target, oof_meta, y_all, train_valid, test,
         accepted_tuned_configs, t0, label='pred_egb/eea')
     shipped_ee = [tt for tt in egb_eea_consumers if egb_eea_verdicts[tt]]
     print(f"\n  Dense pred_egb/pred_eea features SHIP for: {shipped_ee if shipped_ee else '(none)'}")
+
+    # ---- Predicted-partner store for the physics impute-then-anchor
+    # (PHYS_IMPUTE_ANCHORS). These are the SAME leak-safe dense pred_<prop>
+    # series apply_dense_sources just built; here they're kept as
+    # {partner_prop: (train_series, test_series)} so compute_physdelta can use
+    # a *predicted* partner to anchor the ~38% of rows without a *measured*
+    # one -- independent of whether the plain feature version cleared its gate.
+    # ei<-pred_egb+pred_eea filled now; eps<-pred_nc filled after nc runs. ----
+    dense_preds = {}
+    for src in ('egb', 'eea'):
+        key = f'pred_{src}'
+        if key in egb_eea_train_cols:
+            dense_preds[src] = (egb_eea_train_cols[key], egb_eea_test_cols[key])
 
     # ---- Phase 2: OOF stacking + test prediction, small targets. nc
     # first (track_fold_models=True, same as LARGE_TARGETS above) so its
@@ -2577,7 +3205,7 @@ def main():
         'nc', X_by_target, feature_cols_by_target, y_all, train_valid, test,
         test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
         oof_meta, cv_scores, test_predictions, t0,
-        track_fold_models=True)
+        track_fold_models=True, xprop=(xprop_train, xprop_test))
 
     print("\n" + "=" * 100)
     print("Dense pred_nc cross-target feature for eps (model predictions, not lookups)")
@@ -2587,6 +3215,10 @@ def main():
         'nc', nc_X_tr, nc_y_tr, nc_fold_models_by_name, oof_meta,
         X_by_target, test_feat_df_by_target, feature_cols_by_target,
         accepted_tuned_configs, train_valid, test, {'eps'}, t0)
+    # Register pred_nc as the impute-then-anchor partner for eps (eps ~ nc^2 on
+    # the ~38% of eps rows without a co-measured nc). Same series as the plain
+    # feature below -- used here for the anchor regardless of that gate.
+    dense_preds['nc'] = (pred_nc_train, pred_nc_test)
 
     candidate_raw = pd.concat([X_by_target['eps'], pred_nc_train.to_frame()], axis=1)
     candidate_cols = fit_feature_pruner(candidate_raw)
@@ -2616,7 +3248,8 @@ def main():
             tt, X_by_target, feature_cols_by_target, y_all, train_valid, test,
             test_valid_mask, test_feat_df_by_target, accepted_tuned_configs,
             oof_meta, cv_scores, test_predictions, t0,
-            track_fold_models=False)
+            track_fold_models=False, xprop=(xprop_train, xprop_test),
+            dense_preds=dense_preds)
 
     print(f"\n{'target':6s}{'stacked CV R2':>18s}")
     for tt in target_types:
@@ -2661,7 +3294,9 @@ def main():
     submission.to_csv(OUT_PATH, index=False)
     print(f"\nFormat check OK -- saved {OUT_PATH} with shape {submission.shape}")
     print(f">>> Mean CV R2 across all {len(target_types)} targets: {mean_r2:.4f} <<<")
-    print(f"Total elapsed: {time.time()-t0:.0f}s")
+    _elapsed = int(time.time() - t0)
+    print(f"Total elapsed: {_elapsed // 3600:d}:{_elapsed % 3600 // 60:02d}:{_elapsed % 60:02d} "
+          f"(hh:mm:ss)")
 
 
 if __name__ == "__main__":
