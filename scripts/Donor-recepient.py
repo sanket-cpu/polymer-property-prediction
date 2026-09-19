@@ -16,13 +16,30 @@ import time
 # ==========================================================
 # GPU / perf setup
 # ==========================================================
-torch.backends.cudnn.benchmark = True
+# Original code only ever checked torch.cuda.is_available(), so on a Mac
+# (no CUDA -- GPU is Apple Silicon via MPS) it silently fell back to CPU
+# and never used the GPU at all. Detect cuda -> mps -> cpu explicitly.
 if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
+if DEVICE == "cuda":
+    torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-AMP_ENABLED = torch.cuda.is_available()
-AMP_DTYPE = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+# Autocast (AMP) is left CUDA-only: MPS's autocast op coverage is still
+# partial, and this model is small enough (dim=128) that AMP's speed win is
+# marginal next to the risk of silent numerical issues on MPS. Full fp32 on
+# the M-series GPU is still a large speedup over CPU for this workload.
+AMP_ENABLED = DEVICE == "cuda"
+AMP_DTYPE = torch.bfloat16 if (DEVICE == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+# device_type only matters when AMP_ENABLED is True (cuda in that case), so
+# this is safe to pass to torch.autocast() unconditionally.
+AUTOCAST_DEVICE_TYPE = "cuda" if DEVICE == "cuda" else "cpu"
 
 
 # ==========================================================
@@ -50,7 +67,7 @@ class Config:
     save_dir: str = "final_results"
     experiment_name: str = "exp"
     seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = DEVICE  # a plain default is fine here: DEVICE is an immutable str fixed at import time
     test_set_size: int = 10000
 
     # --- Teacher-without-labels / embedding transplant probe ---
@@ -204,12 +221,23 @@ class GrokkingTransformer(nn.Module):
 
         self.token_emb.weight.register_hook(_zero_numeric_grad)
 
-    def forward(self, x):
+    def forward_hidden(self, x):
+        """Same computation as forward(), minus the final unembedding
+        projection -- returns the contextualized residual stream right
+        before it's read out as logits. Since token_emb is TIED (the same
+        matrix serves as both input embedding and output/unembedding
+        projection -- see forward() below), this is the only way to get an
+        'output-side' representation that isn't trivially identical to the
+        input embedding table: it reflects what the attention/MLP blocks
+        have actually computed, not just a static per-token lookup."""
         x = self.token_emb(x)
         for block in self.blocks:
             x = block(x)
-        x = self.ln_f(x)
-        return F.linear(x, self.token_emb.weight[:self.p])
+        return self.ln_f(x)
+
+    def forward(self, x):
+        hidden = self.forward_hidden(x)
+        return F.linear(hidden, self.token_emb.weight[:self.p])
 
     def get_embedding_weights(self):
         return self.token_emb.weight[:self.p].detach().float().cpu().numpy()
@@ -241,24 +269,35 @@ class Curriculum:
         self.test_data = self._create_test_set()
 
     def _create_test_set(self):
-        current_state = torch.get_rng_state()
-        torch.manual_seed(999)
+        # BUG FIX: the original save/restore-RNG-state approach
+        # (torch.get_rng_state()/manual_seed(999)/set_rng_state()) only
+        # saves and restores the CPU RNG. torch.randint(..., device=device)
+        # on cuda/mps draws from that device's own RNG stream, which was
+        # never saved or restored -- so building the test set silently
+        # perturbed the GPU RNG stream by an amount that depends on task_type
+        # (the "mixed" branch draws an extra tensor for is_mul that the
+        # single-task branches skip). That means two runs with the same seed
+        # but different task_type would diverge in their *training* batches
+        # from step 0, defeating the point of fixing a seed for comparison
+        # across configs. Fix: build the test set with its own private CPU
+        # generator and never touch global RNG state at all (correct on
+        # every device, since generation only needs to happen once at init).
         size = self.config.test_set_size
         device = self.config.device
-        a = torch.randint(0, self.p, (size,), device=device)
-        b = torch.randint(0, self.p, (size,), device=device)
+        gen = torch.Generator(device="cpu").manual_seed(999)
+        a = torch.randint(0, self.p, (size,), generator=gen)
+        b = torch.randint(0, self.p, (size,), generator=gen)
         if self.config.task_type == "addition":
-            is_mul = torch.zeros(size, dtype=torch.bool, device=device)
+            is_mul = torch.zeros(size, dtype=torch.bool)
         elif self.config.task_type == "multiplication":
-            is_mul = torch.ones(size, dtype=torch.bool, device=device)
+            is_mul = torch.ones(size, dtype=torch.bool)
         else:
-            is_mul = torch.rand(size, device=device) > 0.5
+            is_mul = torch.rand(size, generator=gen) > 0.5
         ops = torch.where(is_mul, self.mul_token, self.add_token)
         y = torch.where(is_mul, (a * b) % self.p, (a + b) % self.p)
         delim = torch.full_like(a, self.delim_token)
         x = torch.stack([a, b, ops, delim], dim=1)
-        torch.set_rng_state(current_state)
-        return x, y
+        return x.to(device), y.to(device)
 
     def _sample_operands(self, batch_size, device):
         if self.config.curriculum_type == "none" or self.level >= self.max_level:
@@ -294,7 +333,10 @@ class Curriculum:
 
     def get_batch(self, batch_size, mode='train'):
         if mode == 'test':
-            indices = torch.randint(0, len(self.test_data[0]), (batch_size,))
+            # BUG FIX: indices must live on the same device as test_data, or
+            # this raises/refuses to index a cuda/mps tensor with a CPU
+            # index tensor (the original always created indices on CPU).
+            indices = torch.randint(0, len(self.test_data[0]), (batch_size,), device=self.test_data[0].device)
             return self.test_data[0][indices], self.test_data[1][indices]
         device = self.config.device
         a, b = self._sample_operands(batch_size, device)
@@ -341,13 +383,22 @@ class Trainer:
         self.config = config
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay, betas=(0.9, 0.98))
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config.max_steps, eta_min=config.learning_rate * 0.1)
+        # BUG FIX: the original code ran fp16 autocast (whenever bf16 isn't
+        # supported on the CUDA device) with no loss scaling at all -- risks
+        # silently underflowing small gradients to zero, which matters here
+        # since grokking involves long flat-loss plateaus with tiny
+        # gradients. GradScaler(enabled=False) is a harmless no-op
+        # passthrough on any device/dtype (bf16 doesn't need scaling,
+        # CPU/MPS never use it -- this system's AMP_ENABLED is False), so
+        # this is always safe to construct and call unconditionally below.
+        self.scaler = torch.amp.GradScaler("cuda", enabled=(AMP_ENABLED and AMP_DTYPE == torch.float16))
         self.history = {'step': [], 'train_acc': [], 'test_acc': [], 'train_loss': [], 'test_loss': [], 'curriculum_level': [], 'generalization_gap': []}
         self.output_dir = Path(config.save_dir) / config.experiment_name
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def evaluate_test(self):
         self.model.eval()
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=AMP_ENABLED):
+        with torch.no_grad(), torch.autocast(device_type=AUTOCAST_DEVICE_TYPE, dtype=AMP_DTYPE, enabled=AMP_ENABLED):
             x, y = self.curriculum.get_batch(1024, mode='test')
             logits = self.model(x)[:, -1, :]
             loss = F.cross_entropy(logits, y).item()
@@ -363,13 +414,15 @@ class Trainer:
         for step in pbar:
             x, y = self.curriculum.get_batch(self.config.batch_size, mode='train')
             self.model.train()
-            with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=AMP_ENABLED):
+            with torch.autocast(device_type=AUTOCAST_DEVICE_TYPE, dtype=AMP_DTYPE, enabled=AMP_ENABLED):
                 logits = self.model(x)[:, -1, :]
                 loss = F.cross_entropy(logits, y)
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)  # so clip_grad_norm_ sees true (unscaled) gradient norms
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.model.restore_frozen_rows()  # neutralize weight decay / drift on frozen rows -- see comment in _load_transplanted_embedding
             self.scheduler.step()
 
@@ -426,14 +479,21 @@ class Trainer:
 # ==========================================================
 
 def train_donor_model(task, curriculum_type, seed, max_steps, shuffle_labels=False,
-                       weight_decay=1.0, name=None, show_progress=True):
+                       weight_decay=1.0, name=None, show_progress=True, save_full_model=False):
     """task: 'addition' or 'multiplication' -- the donor's own task, generalized
     so both transfer directions (mult->add and add->mult) can be tested with
-    the same function."""
+    the same function.
+
+    save_full_model: opt-in, off by default (matches the original behavior
+    exactly when not passed). Only needed if you'll later want the OUTPUT
+    representation (compute_output_representations / plot_input_vs_output_embedding
+    below) for this donor -- that requires a full forward pass through the
+    trained weights, not just the saved embedding table. Adds ~1.8MB/run."""
     name = name or f"donor_{task}_{'shuffled' if shuffle_labels else 'real'}_s{seed}"
     config = Config(curriculum_type=curriculum_type, task_type=task, seed=seed,
                      max_steps=max_steps, weight_decay=weight_decay,
-                     experiment_name=name, shuffle_donor_labels=shuffle_labels)
+                     experiment_name=name, shuffle_donor_labels=shuffle_labels,
+                     save_full_model=save_full_model)
     torch.manual_seed(seed)
     np.random.seed(seed)
     curriculum_cls = ShuffledLabelCurriculum if shuffle_labels else Curriculum
@@ -448,6 +508,8 @@ def train_donor_model(task, curriculum_type, seed, max_steps, shuffle_labels=Fal
         json.dump({k: v for k, v in result.items() if k not in ['final_embeddings', 'model_state_dict']}, f, indent=2)
     emb_path = out_dir / 'final_embeddings.npy'
     np.save(emb_path, result['final_embeddings'])
+    if save_full_model:
+        torch.save(result['model_state_dict'], out_dir / 'model_state.pt')
 
     tag = 'shuffled' if shuffle_labels else 'real'
     print(f"  [donor:{task}:{tag}] saved {emb_path} (donor final_test_acc={result['final_test_acc']:.4f})")
@@ -455,16 +517,19 @@ def train_donor_model(task, curriculum_type, seed, max_steps, shuffle_labels=Fal
 
 
 def run_transplant_experiment(donor_embedding_path, freeze, seed, tag, recipient_task="addition",
-                               max_steps=40000, weight_decay=1.0, show_progress=True):
+                               max_steps=40000, weight_decay=1.0, show_progress=True, save_full_model=False):
     """recipient_task: the task the FRESH model (receiving the transplanted
     embedding) is trained on -- generalized so this can run either direction
     (donor=multiplication -> recipient_task='addition', or donor=addition ->
-    recipient_task='multiplication')."""
+    recipient_task='multiplication').
+
+    save_full_model: see train_donor_model -- same opt-in, off by default."""
     name = f"{tag}__recip-{recipient_task}__freeze{freeze}__s{seed}"
     config = Config(curriculum_type="complexity", task_type=recipient_task, seed=seed,
                      max_steps=max_steps, weight_decay=weight_decay, experiment_name=name,
                      transplant_embedding_path=donor_embedding_path,
-                     freeze_transplanted_embedding=freeze)
+                     freeze_transplanted_embedding=freeze,
+                     save_full_model=save_full_model)
     torch.manual_seed(seed)
     np.random.seed(seed)
     curriculum_obj = Curriculum(config.p, config)
@@ -477,6 +542,8 @@ def run_transplant_experiment(donor_embedding_path, freeze, seed, tag, recipient
     with open(out_dir / 'results.json', 'w') as f:
         json.dump({k: v for k, v in result.items() if k not in ['final_embeddings', 'model_state_dict']}, f, indent=2)
     np.save(out_dir / 'final_embeddings.npy', result['final_embeddings'])
+    if save_full_model:
+        torch.save(result['model_state_dict'], out_dir / 'model_state.pt')
 
     result['tag'] = tag
     result['freeze'] = freeze
@@ -486,7 +553,7 @@ def run_transplant_experiment(donor_embedding_path, freeze, seed, tag, recipient
 
 def run_teacher_probe_suite(donor_task="multiplication", recipient_task="addition",
                              seeds=(42, 43, 44), donor_steps=40000, transplant_steps=40000,
-                             show_progress=True):
+                             show_progress=True, save_full_model=False):
     """Generalized to run EITHER transfer direction:
       - donor_task='multiplication', recipient_task='addition' (original direction)
       - donor_task='addition', recipient_task='multiplication' (reverse direction)
@@ -495,6 +562,12 @@ def run_teacher_probe_suite(donor_task="multiplication", recipient_task="additio
     asymmetry found earlier (addition consistently more fragile than
     multiplication) -- i.e. does the FRAGILE task transfer worse as a
     RECIPIENT too, not just as an ablation target?
+
+    save_full_model: opt-in, off by default (matches the original behavior
+    exactly when not passed). Pass True if you'll want
+    run_input_output_visualization_suite / plot_input_vs_output_embedding
+    for this run's donors and recipients afterward -- adds ~1.8MB/run on
+    disk, no change to training itself.
     """
     conditions = ['real_donor_frozen', 'real_donor_finetuned', 'shuffled_donor_frozen', 'shuffled_donor_finetuned']
     results = {c: [] for c in conditions}
@@ -504,21 +577,25 @@ def run_teacher_probe_suite(donor_task="multiplication", recipient_task="additio
         print(f"\n=== Teacher probe ({donor_task} -> {recipient_task}): seed {seed} ===")
         print(f"[donor] training real-{donor_task} donor (seed {seed})")
         _, real_path = train_donor_model(donor_task, "complexity", seed, max_steps=donor_steps,
-                                          shuffle_labels=False, show_progress=show_progress)
+                                          shuffle_labels=False, show_progress=show_progress,
+                                          save_full_model=save_full_model)
         donor_paths['real'][seed] = real_path
 
         print(f"[donor] training shuffled-label {donor_task} donor (seed {seed})")
         _, shuf_path = train_donor_model(donor_task, "complexity", seed, max_steps=donor_steps,
-                                          shuffle_labels=True, show_progress=show_progress)
+                                          shuffle_labels=True, show_progress=show_progress,
+                                          save_full_model=save_full_model)
         donor_paths['shuffled'][seed] = shuf_path
 
         for freeze in (True, False):
             r_real = run_transplant_experiment(real_path, freeze, seed, "real_donor",
                                                 recipient_task=recipient_task,
-                                                max_steps=transplant_steps, show_progress=show_progress)
+                                                max_steps=transplant_steps, show_progress=show_progress,
+                                                save_full_model=save_full_model)
             r_shuf = run_transplant_experiment(shuf_path, freeze, seed, "shuffled_donor",
                                                 recipient_task=recipient_task,
-                                                max_steps=transplant_steps, show_progress=show_progress)
+                                                max_steps=transplant_steps, show_progress=show_progress,
+                                                save_full_model=save_full_model)
             key_real = 'real_donor_frozen' if freeze else 'real_donor_finetuned'
             key_shuf = 'shuffled_donor_frozen' if freeze else 'shuffled_donor_finetuned'
             results[key_real].append(r_real)
@@ -1055,7 +1132,10 @@ def plot_single_embedding_pca(ax, embedding: np.ndarray, title: str, p: int):
     var_explained = (S[:2] ** 2).sum() / (S ** 2).sum()
 
     sc = ax.scatter(proj[:, 0], proj[:, 1], c=np.arange(p), cmap='hsv', s=25)
-    ax.set_title(f"{title}\n(top-2 PC var: {var_explained:.1%})", fontsize=10, fontweight='bold')
+    var_note = f"(top-2 PC var: {var_explained:.1%})"
+    # No leading newline when there's no title: in a multi-row grid that blank
+    # line pushed the note up into the row above's x-axis label.
+    ax.set_title(f"{title}\n{var_note}" if title else var_note, fontsize=10, fontweight='bold')
     ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
     ax.set_aspect('equal', adjustable='datalim')
     ax.grid(True, alpha=0.2)
@@ -1070,7 +1150,11 @@ def plot_embedding_grid(embeddings: Dict[str, np.ndarray], p: int, suptitle: str
     n = len(labels)
     ncols = min(ncols, n)
     nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.2 * nrows), squeeze=False)
+    # constrained_layout (not tight_layout) -- it accounts for the suptitle
+    # and the multi-axes colorbar, so row titles no longer collide with the
+    # x-axis labels of the row above.
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.4 * nrows), squeeze=False,
+                             constrained_layout=True)
 
     sc = None
     for i, label in enumerate(labels):
@@ -1087,6 +1171,128 @@ def plot_embedding_grid(embeddings: Dict[str, np.ndarray], p: int, suptitle: str
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved {save_path}")
+
+
+# ==========================================================
+# INPUT vs OUTPUT EMBEDDING COMPARISON
+# ==========================================================
+#
+# token_emb is TIED: the same matrix is used both to look up the input
+# embedding AND (via forward()'s final F.linear) to project onto output
+# logits. So there is no separate "output embedding matrix" sitting in the
+# model -- plotting get_embedding_weights() twice would just be two copies
+# of the same plot. The genuinely different, useful comparison is:
+#   INPUT  = the static, context-free embedding table (get_embedding_weights())
+#   OUTPUT = the CONTEXTUALIZED residual stream for each number, right
+#            before that tied matrix turns it into logits (forward_hidden(),
+#            see GrokkingTransformer above) -- i.e. what the attention/MLP
+#            blocks actually computed, not just a lookup.
+# This tells you whether task structure (e.g. the circular arrangement)
+# already exists at the embedding layer, or only emerges from computation.
+#
+# NOTE: this requires the model's FULL weights (a whole forward pass, not
+# just the saved embedding table), so it only works for runs trained with
+# save_full_model=True -- an opt-in parameter on train_donor_model /
+# run_transplant_experiment / train_mixed_task_model (the last one already
+# defaults to True, since the component-ablation probe already needed it).
+# Existing runs saved before this feature was added won't have model_state.pt
+# and will need a (cheap, no-retraining-elsewhere-required) rerun with
+# save_full_model=True to use this.
+# ==========================================================
+
+def compute_output_representations(config, curriculum_obj, model, task, n_samples_per_number=200,
+                                    fix_other_operand: Optional[int] = None) -> np.ndarray:
+    """For each number v in 0..p-1, probes the model's OUTPUT-side
+    representation: the contextualized final-position hidden state
+    (forward_hidden()[:, -1, :]), pooled over both operand roles (v as the
+    first operand and v as the second), so the result isn't tied to one
+    positional role. Returns a (p, dim) array, directly usable with
+    plot_single_embedding_pca / plot_embedding_grid exactly like an input
+    embedding table -- same shape, same per-row-is-a-number convention.
+
+    fix_other_operand: default None -- the OTHER operand is sampled
+    randomly (n_samples_per_number draws) and averaged over, as before.
+
+    WHY THIS MATTERS: for a task like multiplication where some structure
+    (e.g. "0 absorbs everything") is invariant to the other operand,
+    averaging over random others is fine. But for ADDITION, the correct
+    answer's phase depends on a+b jointly -- if the model encodes the
+    answer circularly (as grokking papers consistently find), averaging
+    the hidden state over many random b at fixed a is mathematically like
+    averaging points around a circle at random angles: it cancels toward
+    the centroid instead of preserving the circle. A representation that
+    looks like a structureless blob under random-b averaging can still be
+    cleanly circular -- the averaging step itself may be destroying the
+    very structure being looked for.
+
+    Passing an int here (e.g. fix_other_operand=0) probes with that FIXED
+    other-operand value instead of averaging over random ones, so a single,
+    undestroyed snapshot of the a-dependent (or b-dependent) structure is
+    returned -- the right mode to use whenever the task's answer depends on
+    both operands jointly rather than being invariant to one of them.
+    """
+    device = config.device
+    p = config.p
+    op_token = curriculum_obj.mul_token if task == 'multiplication' else curriculum_obj.add_token
+    delim_token = curriculum_obj.delim_token
+    model.eval()
+    reps = np.zeros((p, config.dim), dtype=np.float32)
+    with torch.no_grad():
+        for v in range(p):
+            if fix_other_operand is not None:
+                others = torch.full((1,), fix_other_operand, dtype=torch.long, device=device)
+            else:
+                others = torch.randint(0, p, (n_samples_per_number,), device=device)
+            n = others.shape[0]
+            v_col = torch.full((n,), v, dtype=torch.long, device=device)
+            ops = torch.full((n,), op_token, dtype=torch.long, device=device)
+            delim = torch.full((n,), delim_token, dtype=torch.long, device=device)
+            x_a = torch.stack([v_col, others, ops, delim], dim=1)   # v as first operand
+            x_b = torch.stack([others, v_col, ops, delim], dim=1)   # v as second operand
+            x = torch.cat([x_a, x_b], dim=0)
+            hidden = model.forward_hidden(x)[:, -1, :]
+            reps[v] = hidden.mean(dim=0).float().cpu().numpy()
+    model.train()
+    return reps
+
+
+def plot_input_vs_output_embedding(model, config, curriculum_obj, task: str, title: str,
+                                    save_path: Path, n_samples_per_number: int = 200,
+                                    fix_other_operand: Optional[int] = None):
+    """Side-by-side PCA comparison for ONE trained model: its static input
+    embedding table vs. its contextualized output-side representation for
+    `task`. Reuses plot_single_embedding_pca so panels look consistent with
+    every other embedding figure in this file.
+
+    fix_other_operand: forwarded to compute_output_representations -- see
+    that function's docstring. Use this (e.g. =0) for tasks like addition
+    where the answer depends on both operands jointly; leave as None
+    (average over random others) for tasks like multiplication where
+    structure can be invariant to the other operand."""
+    input_emb = model.get_embedding_weights()
+    output_rep = compute_output_representations(config, curriculum_obj, model, task,
+                                                  n_samples_per_number, fix_other_operand)
+    mode_note = f"other operand fixed = {fix_other_operand}" if fix_other_operand is not None else "avg over random other operand"
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.4))
+    plot_single_embedding_pca(axes[0], input_emb, f'Input embedding\n{title}', config.p)
+    plot_single_embedding_pca(axes[1], output_rep, f'Output representation ({task}, {mode_note})\n{title}', config.p)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {save_path}")
+
+
+def load_model_for_inspection(config: Config, curriculum_obj, model_state_path: str) -> 'GrokkingTransformer':
+    """Reconstructs a GrokkingTransformer matching `config`/`curriculum_obj`
+    and loads a saved model_state.pt into it -- the loading half of the
+    save_full_model=True path, for reloading an already-trained run (donor,
+    recipient, or mixed-task) later without retraining, e.g. for
+    plot_input_vs_output_embedding."""
+    model = GrokkingTransformer(config, curriculum_obj.vocab_size).to(config.device)
+    state_dict = torch.load(model_state_path, map_location='cpu')
+    model.load_state_dict(state_dict, strict=True)
+    return model.to(config.device)
 
 
 def collect_teacher_probe_embeddings(donor_paths: Dict[str, Dict[int, str]],
@@ -1133,12 +1339,232 @@ def run_embedding_visualization_suite(donor_paths: Dict[str, Dict[int, str]],
         )
 
 
+def run_input_output_visualization_suite(donor_paths: Dict[str, Dict[int, str]],
+                                          donor_task: str, recipient_task: str,
+                                          direction_label: str, seeds=(42, 43, 44),
+                                          save_dir: Path = Path("final_results/figures"),
+                                          run_dir: Path = Path("final_results"),
+                                          n_samples_per_number: int = 200,
+                                          fix_other_operand: Optional[int] = None):
+    """Input-vs-output-embedding companion to run_embedding_visualization_suite:
+    for each seed, plots plot_input_vs_output_embedding for the donor (real +
+    shuffled) and all 4 recipient conditions.
+
+    REQUIRES save_full_model=True to have been passed to run_teacher_probe_suite
+    for this donor_paths/direction (a model_state.pt, not just the saved
+    embedding table, is needed to compute the output-side representation).
+    Any condition missing model_state.pt is skipped with a one-line warning
+    rather than raising, so this is safe to call even on runs that only
+    partially opted in.
+
+    Saves one PNG per (condition, seed) to save_dir, named
+    input_vs_output_{condition}_{direction_label}_seed{seed}.png -- e.g.
+    input_vs_output_donor_real_multtoadd_seed42.png,
+    input_vs_output_recipient_real_donor_finetuned_multtoadd_seed42.png.
+    """
+    safe_label = direction_label.replace(">", "to").replace(" ", "_")
+
+    def _try_plot(condition_name, task, state_path):
+        state_path = Path(state_path)
+        if not state_path.exists():
+            print(f"  [skip] {condition_name}, seed {seed}: no model_state.pt at {state_path} "
+                  f"(rerun with save_full_model=True to enable this)")
+            return
+        config = Config(curriculum_type="complexity", task_type=task, seed=seed)
+        curriculum_obj = Curriculum(config.p, config)
+        model = load_model_for_inspection(config, curriculum_obj, str(state_path))
+        plot_input_vs_output_embedding(
+            model, config, curriculum_obj, task=task,
+            title=f"{condition_name} ({direction_label}, seed {seed})",
+            save_path=save_dir / f"input_vs_output_{condition_name}_{safe_label}_seed{seed}.png",
+            n_samples_per_number=n_samples_per_number, fix_other_operand=fix_other_operand)
+
+    for seed in seeds:
+        print(f"\n=== Input vs output embeddings ({direction_label}), seed {seed} ===")
+        real_donor_dir = Path(donor_paths['real'][seed]).parent
+        shuf_donor_dir = Path(donor_paths['shuffled'][seed]).parent
+        _try_plot('donor_real', donor_task, real_donor_dir / 'model_state.pt')
+        _try_plot('donor_shuffled', donor_task, shuf_donor_dir / 'model_state.pt')
+
+        for tag, label in [('real_donor', 'recipient_real_donor'), ('shuffled_donor', 'recipient_shuffled_donor')]:
+            for freeze, freeze_label in [(True, 'frozen'), (False, 'finetuned')]:
+                cond_dir = run_dir / f"{tag}__recip-{recipient_task}__freeze{freeze}__s{seed}"
+                _try_plot(f"{label}_{freeze_label}", recipient_task, cond_dir / 'model_state.pt')
+
+
+# ==========================================================
+# PAPER-READY GRIDS: seeds x cases, both directions, input AND output
+# ==========================================================
+#
+# Publication-style small-multiples: one figure per (mode, direction), rows
+# = seeds, columns = the 6 donor/recipient cases. Input and output are kept
+# as SEPARATE figures (rather than doubling the column count into a 12-wide
+# grid) so each one stays single-purpose and easy to caption, matching how
+# this kind of comparison is usually laid out in a paper.
+#
+# mode='output' uses a fixed, TASK-APPROPRIATE identity operand (0 for
+# addition, 1 for multiplication) rather than averaging over random
+# co-operands: averaging destructively cancels phase-dependent circular
+# structure (see compute_output_representations' docstring), and using the
+# SAME fixed operand for every panel would make every multiplication-task
+# probe degenerate if that operand were 0 (v*0=0 always). Each panel uses
+# its own task's identity element, not one fixed value for the whole grid.
+# ==========================================================
+
+CASE_ORDER = [
+    ('donor_real', 'Donor (real)'),
+    ('donor_shuffled', 'Donor (shuffled)'),
+    ('recip_real_frozen', 'Recipient: real donor,\nfrozen'),
+    ('recip_real_finetuned', 'Recipient: real donor,\nfinetuned'),
+    ('recip_shuffled_frozen', 'Recipient: shuffled donor,\nfrozen'),
+    ('recip_shuffled_finetuned', 'Recipient: shuffled donor,\nfinetuned'),
+]
+
+
+def _case_model_state_path(case: str, donor_task: str, recipient_task: str, seed: int, run_dir: Path):
+    """Returns (model_state.pt path, task that model was trained on) for one
+    of the 6 CASE_ORDER entries -- the single source of truth for the
+    directory-naming convention used by train_donor_model /
+    run_transplant_experiment, so ensure_direction_trained and
+    plot_paper_grid can never disagree about where a given case lives."""
+    if case == 'donor_real':
+        return run_dir / f'donor_{donor_task}_real_s{seed}' / 'model_state.pt', donor_task
+    if case == 'donor_shuffled':
+        return run_dir / f'donor_{donor_task}_shuffled_s{seed}' / 'model_state.pt', donor_task
+    tag, freeze = {
+        'recip_real_frozen': ('real_donor', True),
+        'recip_real_finetuned': ('real_donor', False),
+        'recip_shuffled_frozen': ('shuffled_donor', True),
+        'recip_shuffled_finetuned': ('shuffled_donor', False),
+    }[case]
+    return run_dir / f'{tag}__recip-{recipient_task}__freeze{freeze}__s{seed}' / 'model_state.pt', recipient_task
+
+
+def ensure_direction_trained(donor_task: str, recipient_task: str, seeds=(42, 43, 44),
+                              donor_steps: int = 40000, transplant_steps: int = 40000,
+                              show_progress: bool = True, run_dir: Path = Path("final_results")):
+    """Makes sure every (case, seed) combination for this direction has a
+    model_state.pt on disk -- SKIPS any seed where all 6 conditions already
+    have full weights saved (reusing already-good data instead of paying
+    for a redundant, non-reproducible retrain -- this backend isn't
+    bit-deterministic across runs even with a fixed seed, so a 'redundant'
+    retrain wouldn't even recreate the same numbers). Otherwise trains that
+    seed's full 6-model set fresh (donor real + shuffled, then all 4
+    recipient conditions) with save_full_model=True.
+
+    Returns donor_paths (the {'real'/'shuffled': {seed: embedding_path}}
+    dict, for every seed regardless of whether it was skipped or trained
+    here) in the same shape run_teacher_probe_suite returns.
+    """
+    donor_paths = {'real': {}, 'shuffled': {}}
+    for seed in seeds:
+        state_paths = [_case_model_state_path(case, donor_task, recipient_task, seed, run_dir)[0]
+                        for case, _ in CASE_ORDER]
+        real_dir = run_dir / f'donor_{donor_task}_real_s{seed}'
+        shuf_dir = run_dir / f'donor_{donor_task}_shuffled_s{seed}'
+        if all(p.exists() for p in state_paths):
+            print(f"  [skip] {donor_task}->{recipient_task}, seed {seed}: all 6 conditions already have model_state.pt")
+            donor_paths['real'][seed] = str(real_dir / 'final_embeddings.npy')
+            donor_paths['shuffled'][seed] = str(shuf_dir / 'final_embeddings.npy')
+            continue
+
+        print(f"\n=== Training full 6-model set for seed {seed} ({donor_task} -> {recipient_task}) ===")
+        _, real_path = train_donor_model(donor_task, "complexity", seed, max_steps=donor_steps,
+                                          shuffle_labels=False, show_progress=show_progress, save_full_model=True)
+        _, shuf_path = train_donor_model(donor_task, "complexity", seed, max_steps=donor_steps,
+                                          shuffle_labels=True, show_progress=show_progress, save_full_model=True)
+        donor_paths['real'][seed] = real_path
+        donor_paths['shuffled'][seed] = shuf_path
+
+        for freeze in (True, False):
+            run_transplant_experiment(real_path, freeze, seed, "real_donor", recipient_task=recipient_task,
+                                       max_steps=transplant_steps, show_progress=show_progress, save_full_model=True)
+            run_transplant_experiment(shuf_path, freeze, seed, "shuffled_donor", recipient_task=recipient_task,
+                                       max_steps=transplant_steps, show_progress=show_progress, save_full_model=True)
+    return donor_paths
+
+
+def plot_paper_grid(donor_task: str, recipient_task: str, direction_label: str, seeds, mode: str,
+                     save_dir: Path = Path("final_results/figures"), run_dir: Path = Path("final_results"),
+                     n_samples_per_number: int = 200):
+    """Publication-style grid: rows = seeds, columns = the 6 CASE_ORDER
+    cases, for ONE mode ('input' or 'output'). Requires
+    ensure_direction_trained to have already been run for this direction/
+    these seeds (any missing model_state.pt is rendered as an empty
+    'missing' panel rather than raising, so a partially-trained set still
+    produces a usable figure)."""
+    assert mode in ('input', 'output')
+    n_rows, n_cols = len(seeds), len(CASE_ORDER)
+    # constrained_layout reserves space between rows for each panel's title
+    # (the "(top-2 PC var: X%)" line) -- without it, row N+1's title overlaps
+    # row N's x-axis tick labels/"PC1" text, which is the overlap being fixed.
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 3.8 * n_rows), squeeze=False,
+                             constrained_layout=True)
+    sc = None
+    for i, seed in enumerate(seeds):
+        for j, (case, case_label) in enumerate(CASE_ORDER):
+            ax = axes[i][j]
+            state_path, task = _case_model_state_path(case, donor_task, recipient_task, seed, run_dir)
+            col_header = case_label if i == 0 else ''
+            if not state_path.exists():
+                ax.text(0.5, 0.5, 'missing\nmodel_state.pt', ha='center', va='center', fontsize=9, color='gray')
+                ax.set_xticks([]); ax.set_yticks([])
+                if col_header:
+                    ax.set_title(col_header, fontsize=10, fontweight='bold')
+                continue
+
+            config = Config(curriculum_type="complexity", task_type=task, seed=seed)
+            curriculum_obj = Curriculum(config.p, config)
+            model = load_model_for_inspection(config, curriculum_obj, str(state_path))
+            if mode == 'input':
+                emb = model.get_embedding_weights()
+            else:
+                identity = 0 if task == 'addition' else 1
+                emb = compute_output_representations(config, curriculum_obj, model, task,
+                                                       n_samples_per_number, fix_other_operand=identity)
+                col_header = f"{col_header} (b={identity})" if col_header else col_header
+            plot_single_embedding_pca(ax, emb, col_header, config.p)
+            sc = ax.collections[-1]
+            if j == 0:
+                ax.set_ylabel(f"seed {seed}\nPC2", fontsize=11, fontweight='bold')
+
+    mode_title = 'Input Embeddings' if mode == 'input' else 'Output Representations'
+    fig.suptitle(f'{mode_title} Across Seeds and Conditions ({direction_label})', fontsize=15, fontweight='bold')
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=axes, shrink=0.7, pad=0.01)
+        cbar.set_label('token value (mod p)', fontsize=10)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = direction_label.replace(">", "to").replace(" ", "_")
+    fname = save_dir / f"paper_grid_{mode}_{safe_label}.png"
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {fname}")
+    return fname
+
+
+def run_paper_figure_suite(seeds=(42, 43, 44), show_progress: bool = True):
+    """Top-level driver: ensures every (direction, seed, case) combination
+    has full model weights saved -- training whatever is missing, skipping
+    whatever's already there -- then builds the 4 publication-ready grids
+    (input/output x mult->add/add->mult). This is the function to call for
+    'give me the paper figures for both directions, all seeds, all cases'."""
+    directions = [("multiplication", "addition", "mult>add"), ("addition", "multiplication", "add>mult")]
+
+    for donor_task, recipient_task, direction_label in directions:
+        print(f"\n{'=' * 60}\nEnsuring models trained: {direction_label}\n{'=' * 60}")
+        ensure_direction_trained(donor_task, recipient_task, seeds=seeds, show_progress=show_progress)
+
+    for donor_task, recipient_task, direction_label in directions:
+        for mode in ('input', 'output'):
+            plot_paper_grid(donor_task, recipient_task, direction_label, seeds, mode)
+
+
 # ==========================================================
 # Main -- narrowed scope: teacher probe + component ablation ONLY
 # ==========================================================
 
 if __name__ == "__main__":
-    print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'} | AMP enabled: {AMP_ENABLED}")
+    print(f"Device: {DEVICE} | AMP enabled: {AMP_ENABLED}")
 
     # add -> mult was already run in a previous session, POST weight-decay
     # fix -- hardcoded here from that run's printed output rather than
@@ -1172,7 +1598,8 @@ if __name__ == "__main__":
     # determines whether frozen-real success is symmetric across directions
     # or specific to add->mult.
     probe_m2a, donor_paths_m2a = run_teacher_probe_suite(
-        donor_task="multiplication", recipient_task="addition", seeds=(42, 43, 44))
+        donor_task="multiplication", recipient_task="addition", seeds=(42, 43, 44),
+        save_full_model=True)  # so run_paper_figure_suite below can reuse these instead of retraining them
     summary_m2a = summarize_teacher_probe(probe_m2a, direction_label="mult>add")
     plot_teacher_probe(summary_m2a, direction_label="mult>add")
     run_embedding_visualization_suite(
@@ -1190,3 +1617,12 @@ if __name__ == "__main__":
           "run_extended_frozen_suite(donor_paths_m2a, recipient_task='addition', ...) "
           "using donor_paths_m2a returned above, if wanted -- note the extended-horizon "
           "results collected before the fix are also invalid and would need rerunning.)")
+
+    # Paper-ready seeds x cases grids, both directions. mult->add was just
+    # trained above WITH save_full_model=True, so this reuses those models
+    # instead of retraining them (ensure_direction_trained skips any seed
+    # where all 6 conditions already have model_state.pt) -- only add->mult
+    # (all 3 seeds, never trained with saved weights before) actually runs
+    # fresh here.
+    print("\n=== Paper-ready input/output embedding grids (both directions, all seeds) ===")
+    run_paper_figure_suite(seeds=(42, 43, 44))
